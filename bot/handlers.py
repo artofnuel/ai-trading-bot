@@ -529,6 +529,7 @@ def register_handlers(app: Application) -> None:
             CommandHandler("cancel", cancel),
         ],
         allow_reentry=True,
+        per_message=True,
     )
 
     app.add_handler(CommandHandler("start", start))

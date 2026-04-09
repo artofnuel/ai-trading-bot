@@ -33,11 +33,9 @@ def main() -> None:
     """Initialise the DB and start the bot."""
     logger.info("Starting AI Trade Planner Bot…")
 
-    # Ensure SQLite tables exist (run synchronously before the bot loop starts)
-    asyncio.run(init_db())
-
     # Build the Telegram Application
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # post_init(init_db) ensures the DB is set up INSIDE the bot's event loop
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(init_db).build()
 
     # Attach all command / message handlers
     register_handlers(app)

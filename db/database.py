@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS trades (
 
 # ── Initialisation ────────────────────────────────────────────────────────────
 
-async def init_db() -> None:
+async def init_db(app: Optional[Application] = None) -> None:
     """Create tables if they do not already exist."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(CREATE_USERS_TABLE)
