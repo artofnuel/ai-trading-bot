@@ -18,7 +18,7 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 # ── Anthropic / Claude ────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL: str = "claude-3-5-sonnet-latest"
+CLAUDE_MODEL: str = "claude-3-5-sonnet-20241022"
 
 # ── Claude request settings ───────────────────────────────────────────────────
 CLAUDE_TIMEOUT: int = 30          # seconds before we give up waiting for Claude
