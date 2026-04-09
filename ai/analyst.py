@@ -12,7 +12,13 @@ import logging
 import re
 from typing import Optional
 
-import anthropic
+from anthropic import (
+    AsyncAnthropic,
+    APITimeoutError,
+    APIConnectionError,
+    RateLimitError,
+    APIStatusError,
+)
 
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS, CLAUDE_TIMEOUT
 
@@ -115,36 +121,30 @@ async def get_trade_plan(
     Raises:
         AnalystError — on API failure, timeout, or invalid JSON response.
     """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    user_prompt = _build_user_prompt(balance, market, pair, risk, notes)
+    async with AsyncAnthropic(api_key=ANTHROPIC_API_KEY) as client:
+        user_prompt = _build_user_prompt(balance, market, pair, risk, notes)
 
-    logger.info(
-        "Requesting trade plan | market=%s pair=%s risk=%s balance=%.2f",
-        market, pair, risk, balance,
-    )
+        logger.info(
+            "Requesting trade plan | market=%s pair=%s risk=%s balance=%.2f",
+            market, pair, risk, balance,
+        )
 
-    try:
-        # anthropic's SDK is synchronous — run it in a thread executor so it
-        # doesn't block the entire async event loop for every user.
-        loop = asyncio.get_event_loop()
-        message = await loop.run_in_executor(
-            None,
-            lambda: client.messages.create(
+        try:
+            message = await client.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=CLAUDE_MAX_TOKENS,
                 timeout=CLAUDE_TIMEOUT,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}],
-            ),
-        )
-    except anthropic.APITimeoutError:
-        raise AnalystError("Claude API timed out. Please try again in a moment.")
-    except anthropic.APIConnectionError as exc:
-        raise AnalystError(f"Connection error reaching Claude: {exc}")
-    except anthropic.RateLimitError:
-        raise AnalystError("Rate limit reached. Please wait a moment and try again.")
-    except anthropic.APIStatusError as exc:
-        raise AnalystError(f"Claude API error {exc.status_code}: {exc.message}")
+            )
+        except APITimeoutError:
+            raise AnalystError("Claude API timed out. Please try again in a moment.")
+        except APIConnectionError as exc:
+            raise AnalystError(f"Connection error reaching Claude: {exc}")
+        except RateLimitError:
+            raise AnalystError("Rate limit reached. Please wait a moment and try again.")
+        except APIStatusError as exc:
+            raise AnalystError(f"Claude API error {exc.status_code}: {exc.message}")
 
     # Extract raw text from the response
     raw_text: str = message.content[0].text.strip()
