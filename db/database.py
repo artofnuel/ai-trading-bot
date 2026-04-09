@@ -7,11 +7,14 @@ Handles all persistence: users and trade history.
 import json
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import aiosqlite
 
 from config import DATABASE_PATH
+
+if TYPE_CHECKING:
+    from telegram.ext import Application
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ CREATE TABLE IF NOT EXISTS trades (
 
 # ── Initialisation ────────────────────────────────────────────────────────────
 
-async def init_db(app: Optional[Application] = None) -> None:
+async def init_db(app: Optional["Application"] = None) -> None:
     """Create tables if they do not already exist."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(CREATE_USERS_TABLE)
