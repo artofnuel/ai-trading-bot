@@ -8,7 +8,7 @@ Type=simple
 User=your_vps_username
 WorkingDirectory=/home/your_vps_username/trade-bot
 EnvironmentFile=/home/your_vps_username/trade-bot/.env
-ExecStart=/usr/bin/python3 main.py
+ExecStart=/home/your_vps_username/trade-bot/venv/bin/python main.py
 Restart=always
 RestartSec=10
 # Capture stdout/stderr to journald

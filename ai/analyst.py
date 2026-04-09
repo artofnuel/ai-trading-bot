@@ -6,6 +6,7 @@ validated trade plan dict. All API errors are caught and re-raised as
 a descriptive AnalystError so callers can respond gracefully.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -34,7 +35,7 @@ outside the JSON object. The response must be parseable directly by json.loads()
 
 Use your knowledge of current market conditions and price structure to give realistic price \
 levels. If no pair is specified, recommend the highest-probability setup across:
-- Forex majors: EUR/USD, GBP/USD, USD/JPY, GBP/JPY
+- Forex majors: EUR/USD, GBP/USD, USD/JPY, GBP/JPY, XAU/USD
 - Crypto: BTC/USDT, ETH/USDT
 
 The JSON schema you MUST follow exactly:
@@ -47,6 +48,7 @@ The JSON schema you MUST follow exactly:
   "stop_loss_pips": <integer>,
   "risk_amount": "$<amount>",
   "risk_percent": <1 | 2 | 3>,
+  "market_trend": "<bullish | bearish | neutral>",
   "take_profits": [
     {"label": "TP1", "price": "<string>", "pips": <int>, "rr": "1:X", "partial_close": "<percent>"},
     {"label": "TP2", "price": "<string>", "pips": <int>, "rr": "1:X", "partial_close": "<percent>"},
@@ -122,14 +124,18 @@ async def get_trade_plan(
     )
 
     try:
-        # anthropic's SDK is synchronous; wrap with asyncio timeout via httpx
-        # (the library internally uses httpx which respects the timeout param)
-        message = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=CLAUDE_MAX_TOKENS,
-            timeout=CLAUDE_TIMEOUT,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
+        # anthropic's SDK is synchronous — run it in a thread executor so it
+        # doesn't block the entire async event loop for every user.
+        loop = asyncio.get_event_loop()
+        message = await loop.run_in_executor(
+            None,
+            lambda: client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=CLAUDE_MAX_TOKENS,
+                timeout=CLAUDE_TIMEOUT,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            ),
         )
     except anthropic.APITimeoutError:
         raise AnalystError("Claude API timed out. Please try again in a moment.")
