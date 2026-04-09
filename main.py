@@ -29,12 +29,12 @@ logger = logging.getLogger(__name__)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main() -> None:
+def main() -> None:
     """Initialise the DB and start the bot."""
     logger.info("Starting AI Trade Planner Bot…")
 
-    # Ensure SQLite tables exist
-    await init_db()
+    # Ensure SQLite tables exist (run synchronously before the bot loop starts)
+    asyncio.run(init_db())
 
     # Build the Telegram Application
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -44,9 +44,9 @@ async def main() -> None:
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
 
-    # Start polling — this blocks until the process is stopped
-    await app.run_polling(drop_pending_updates=True)
+    # run_polling() manages its own event loop — do NOT await it
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
