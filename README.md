@@ -172,7 +172,7 @@ Check GBP/USD, conservative, I think NFP might move it
 |---|---|
 | Language | Python 3.11+ |
 | Telegram | python-telegram-bot v21 (async) |
-| AI Engine | Anthropic Claude (`claude-sonnet-4-5-20251001`) |
+| AI Engine | Anthropic Claude (`claude-sonnet-4-6-20251001`) |
 | Storage | SQLite via aiosqlite |
 | Config | python-dotenv |
 | Hosting | Google Cloud VPS (e2-micro, Ubuntu) |

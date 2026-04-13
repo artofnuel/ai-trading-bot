@@ -400,13 +400,21 @@ async def _generate_and_send(message: Message, context: ContextTypes.DEFAULT_TYP
     await message.chat.send_action(ChatAction.TYPING)
 
     try:
-        plan = await get_trade_plan(
+        plan, price_ok = await get_trade_plan(
             balance=balance,
             market=market,
             pair=pair,
             risk=risk,
             notes=notes,
         )
+        
+        # If live price fetch failed, notify the user
+        if not price_ok:
+            await message.reply_text(
+                "⚠️ Notice: Live price fetching failed. Claude is estimating levels based on its training data. "
+                "Please verify prices manually before executing."
+            )
+            
     except AnalystError as exc:
         await thinking_msg.delete()
         await message.reply_text(f"❌ Analysis failed:\n{exc}\n\nPlease try again with /trade.")

@@ -17,103 +17,106 @@ def _direction_emoji(direction: str) -> str:
 # ── Main formatter ────────────────────────────────────────────────────────────
 
 def format_trade_plan(plan: dict, balance: float) -> str:
-    """
-    Render a trade plan dict as a human-readable Telegram message string.
+    direction = plan.get("direction", "")
+    dir_emoji = "🟢" if direction == "BUY" else "🔴"
+    pair = plan.get("pair", "N/A")
+    lot_size = float(plan.get("lot_size", 0))
+    min_lot_warning = plan.get("minimum_lot_warning", False)
+    market = "Crypto" if any(c in pair for c in ["BTC", "ETH", "SOL", "BNB"]) else "Forex"
 
-    Args:
-        plan    : Validated trade plan dict from ai/analyst.py.
-        balance : User's account balance (for the account section).
+    lines = []
 
-    Returns:
-        A formatted multi-line string safe to send via Telegram (MarkdownV2
-        is intentionally avoided — plain text is used for reliability).
-    """
-    sep = "━━━━━━━━━━━━━━━━━━━━"
-    direction = plan.get("direction", "N/A").upper()
-    pair = plan.get("pair", "N/A").upper()
-    confluence = plan.get("confluence_score", "?")
-    session = plan.get("session", "N/A")
-    execution = plan.get("execution", "N/A")
+    # ── Header ────────────────────────────────────────────────
+    lines.append(f"📊 TRADE PLAN — {pair}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"Direction   : {dir_emoji} {direction}")
+    lines.append(f"Execution   : {plan.get('execution', 'N/A')}")
+    lines.append(f"Session     : {plan.get('session', 'N/A')}")
+    lines.append(f"Confluence  : ⭐ {plan.get('confluence_score', 'N/A')}/10")
 
-    # ── Header ────────────────────────────────────────────────────────────────
-    lines = [
-        f"📊 TRADE PLAN — {pair}",
-        sep,
-        f"Direction   : {_direction_emoji(direction)} {direction}",
-        f"Execution   : {execution}",
-        f"Session     : {session}",
-        f"Confluence  : ⭐ {confluence}/10",
-        sep,
-    ]
+    # ── Account ───────────────────────────────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💰 ACCOUNT")
+    lines.append(f"Balance     : ${balance:,.2f}")
+    lines.append(f"At Risk     : {plan.get('risk_amount', 'N/A')} ({plan.get('risk_percent', 'N/A')}%)")
 
-    # ── Account ───────────────────────────────────────────────────────────────
-    risk_amount = plan.get("risk_amount", "N/A")
-    risk_pct = plan.get("risk_percent", "N/A")
-    lines += [
-        "💰 ACCOUNT",
-        f"Balance     : ${balance:,.2f}",
-        f"At Risk     : {risk_amount} ({risk_pct}%)",
-        sep,
-    ]
+    # ── Position Size ─────────────────────────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("📐 POSITION SIZE")
+    lines.append(f"Lot Size    : {plan.get('lot_size', 'N/A')}")
+    lines.append(f"Pip Value   : {plan.get('pip_value', 'N/A')}")
+    if min_lot_warning:
+        lines.append(
+            f"⚠️ True lot size was below 0.01 minimum. Rounded up to 0.01 — "
+            f"actual risk is {plan.get('risk_percent')}% of balance, "
+            f"higher than your intended risk. Consider a larger account balance."
+        )
 
-    # ── Levels ────────────────────────────────────────────────────────────────
-    entry = plan.get("entry", "N/A")
-    sl = plan.get("stop_loss", "N/A")
-    sl_pips = plan.get("stop_loss_pips", "N/A")
-    lines += [
-        "📍 LEVELS",
-        f"Entry       : {entry}",
-        f"Stop Loss   : {sl} ({sl_pips} pips)",
-        sep,
-    ]
+    # ── Current Price + Levels ────────────────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("📍 LEVELS")
+    lines.append(f"Market Price: {plan.get('current_market_price', 'N/A')}")
+    lines.append(f"Entry       : {plan.get('entry', 'N/A')}")
+    lines.append(
+        f"Stop Loss   : {plan.get('stop_loss', 'N/A')} "
+        f"({plan.get('stop_loss_pips', 'N/A')} pips)"
+    )
 
-    # ── Take Profits ──────────────────────────────────────────────────────────
+    # ── Take Profits ──────────────────────────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("🎯 TAKE PROFITS")
-    take_profits: list = plan.get("take_profits", [])
-    est_tp2 = plan.get("estimated_profit_at_tp2", "")
-    est_tp3 = plan.get("estimated_profit_at_tp3", "")
+    tp_profit_keys = [
+        "estimated_profit_at_tp1",
+        "estimated_profit_at_tp2",
+        "estimated_profit_at_tp3",
+    ]
+    for i, tp in enumerate(plan.get("take_profits", [])):
+        profit = plan.get(tp_profit_keys[i], "N/A")
+        lines.append(
+            f"{tp['label']} → {tp['price']} | {tp['rr']:>5} "
+            f"| Close {tp['partial_close']} → Est. profit: {profit}"
+        )
+    lines.append(f"Total if all TPs hit  → {plan.get('total_potential_profit', 'N/A')}")
 
-    for tp in take_profits:
-        label = tp.get("label", "TP?")
-        price = tp.get("price", "N/A")
-        rr = tp.get("rr", "N/A")
-        partial = tp.get("partial_close", "N/A")
-        suffix = ""
-        if label == "TP2" and est_tp2:
-            suffix = f" → Est. profit: {est_tp2}"
-        elif label == "TP3" and est_tp3:
-            suffix = f" → Est. profit: {est_tp3}"
-        lines.append(f"{label} → {price} | {rr:>5} | Close {partial}{suffix}")
-
-    lines.append(sep)
-
-    # ── Trailing Stop ─────────────────────────────────────────────────────────
+    # ── Trailing Stop ─────────────────────────────────────────
     ts = plan.get("trailing_stop", {})
-    if ts.get("recommended"):
-        activate = ts.get("activate_at", "TP1")
-        trail = ts.get("trail_distance", "N/A")
-        rationale = ts.get("rationale", "")
-        lines += [
-            "🔁 TRAILING STOP",
-            f"Activate at {activate} → Trail {trail}",
-            rationale,
-            sep,
-        ]
+    if ts and ts.get("recommended"):
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🔁 TRAILING STOP")
+        lines.append(
+            f"Activate at {ts.get('activate_at')} → Trail {ts.get('trail_distance')}"
+        )
+        lines.append(ts.get("rationale", ""))
 
-    # ── Analysis ──────────────────────────────────────────────────────────────
-    rationale: str = plan.get("rationale", "")
-    if rationale:
-        # Wrap long rationale lines at word boundaries for mobile readability
-        lines += ["📖 ANALYSIS", _wrap(rationale, width=50), sep]
+    # ── MT5 Setup (Forex only) ────────────────────────────────
+    mt5 = plan.get("mt5_setup")
+    if mt5 and market == "Forex":
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🖥 MT5 SETUP")
+        lines.append(f"Symbol      : {mt5.get('symbol')}")
+        lines.append(f"Order Type  : {mt5.get('order_type')}")
+        lines.append(f"Volume      : {mt5.get('volume')}")
+        lines.append(f"Price       : {mt5.get('price')}")
+        lines.append(f"Stop Loss   : {mt5.get('sl')}")
+        lines.append(f"Take Profit : {mt5.get('tp')} (TP1)")
+        lines.append(f"Comment     : {mt5.get('comment')}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📌 {mt5.get('note')}")
 
-    # ── Caution ───────────────────────────────────────────────────────────────
-    caution: str = plan.get("caution", "")
-    if caution:
-        lines += [f"⚠️  CAUTION", caution, sep]
+    # ── Analysis ──────────────────────────────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("📖 ANALYSIS")
+    lines.append(plan.get("rationale", "N/A"))
 
-    # ── Timestamp ─────────────────────────────────────────────────────────────
-    ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines.append(f"⏱ Generated: {ts_str}")
+    # ── Caution ───────────────────────────────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("⚠️  CAUTION")
+    lines.append(plan.get("caution", "N/A"))
+
+    # ── Timestamp ─────────────────────────────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    from datetime import datetime, timezone
+    lines.append(f"⏱ Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
 
     return "\n".join(lines)
 
