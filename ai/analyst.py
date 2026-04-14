@@ -57,32 +57,20 @@ BUY trades:
 Never guess. Always calculate from the live price provided.
 
 ════════════════════════════════════════
-LOT SIZE RULES — NON-NEGOTIABLE
+LOT SIZE AND CALCULATION RULES
 ════════════════════════════════════════
-Minimum lot size is 0.01. Never return below 0.01.
+The trader specifies their own lot size in the user prompt.
+Use EXACTLY that lot size — do not change, round, or override it.
+Set minimum_lot_warning to false always (trader chose their size).
 
-Steps:
-1. Calculate: lot = Risk Amount ÷ (SL pips × pip value per standard lot)
-2. If lot < 0.01, round UP to 0.01
-3. Recalculate actual risk: actual_risk = SL pips × pip value × 0.01
-4. Recalculate actual risk %: (actual_risk ÷ balance) × 100
-5. Return actual values — not intended ones
-6. Set minimum_lot_warning: true if rounding occurred
+Calculate ALL values with mathematical precision:
+- risk_amount: exact dollar loss if SL is hit at specified lot size
+- risk_percent: (risk_amount ÷ balance) × 100, to 2 decimal places
+- estimated_profit_at_tp1/2/3: exact profit from that partial close
+- total_potential_profit: exact sum of all three partial profits
+- pip_value: exact pip value at the specified lot size
 
-Pip values per standard lot:
-  - USD pairs (EUR/USD, GBP/USD): $10/pip → $0.10/pip at 0.01 lot
-  - JPY pairs (USD/JPY, GBP/JPY): ~$7–9/pip → ~$0.07–0.09/pip at 0.01 lot
-  - Crypto: size in base currency units, minimum 0.001
-
-════════════════════════════════════════
-PROFIT CALCULATIONS
-════════════════════════════════════════
-- estimated_profit_at_tp1: profit from closing TP1 partial % only
-- estimated_profit_at_tp2: profit from closing TP2 partial % only
-- estimated_profit_at_tp3: profit from closing TP3 partial % only
-- total_potential_profit: sum of all three
-
-All profit values must use the actual lot size after minimum enforcement.
+No rounding. No approximations. Real numbers only.
 
 ════════════════════════════════════════
 MT5 SETUP
@@ -152,10 +140,39 @@ def _build_user_prompt(
     notes: str,
     live_price: Optional[str],
     pair_prices: Optional[dict],
+    lot_size: str = "0.01",
 ) -> str:
     risk_map = {"conservative": 1, "moderate": 2, "aggressive": 3}
     risk_pct = risk_map.get(risk.lower(), 2)
     risk_amount = balance * risk_pct / 100
+
+    lot_size_section = f"""\
+Lot Size (USER SPECIFIED): {lot_size}
+This is the EXACT lot size the trader wants to use. Do not change it.
+Do not round it. Do not suggest a different size.
+
+EXACT PROFIT AND LOSS CALCULATIONS — NO ROUNDING, NO ESTIMATING:
+Use the trader's specified lot size of {lot_size} for all calculations.
+
+For Forex pairs:
+  - Standard pip value = $10 per pip per 1.00 lot
+  - Pip value at {lot_size} lots = ${float(lot_size) * 10:.4f} per pip
+  - For JPY pairs pip value = ~$7.00 per pip per lot (use current rate to be precise)
+  - For XAU/USD (Gold): 1 pip = $0.01 price move, pip value = $1.00 per 0.01 lot
+  - Loss if SL hit = SL pips × pip value at specified lot size
+  - Profit at each TP = TP pips × pip value × partial close percentage
+
+For Crypto pairs:
+  - Position value = lot size × current price
+  - PnL = price difference × lot size
+  - Calculate exactly, no approximations
+
+DO NOT use minimum lot enforcement — the trader has chosen their lot size.
+DO NOT warn about minimum lots — trader is aware.
+Calculate risk_amount and risk_percent from the ACTUAL specified lot size.
+Calculate ALL profit figures from the ACTUAL specified lot size.
+Every number must be mathematically exact based on live price and specified lot size.
+"""
 
     # ── Pair and price section ────────────────────────────────
     if pair:
@@ -201,6 +218,8 @@ Market          : {market}
 Risk Appetite   : {risk.capitalize()} ({risk_pct}% = ${risk_amount:,.2f} at risk)
 Additional Notes: {notes or 'None'}
 
+{lot_size_section}
+
 {price_section}
 
 Return ONLY the JSON object. No markdown, no extra text.
@@ -215,13 +234,11 @@ async def get_trade_plan(
     pair: Optional[str] = None,
     risk: str = "moderate",
     notes: str = "",
-) -> tuple[dict, bool]:
+    lot_size: str = "0.01",
+) -> dict:
     """
     Fetch live market price then call Claude to generate
     a trade plan anchored to real current market conditions.
-
-    Returns:
-        (plan_dict, price_ok_bool)
     """
 
     # ── Step 1: Fetch live price(s) ───────────────────────────
@@ -258,6 +275,7 @@ async def get_trade_plan(
         notes=notes,
         live_price=live_price,
         pair_prices=pair_prices,
+        lot_size=lot_size,
     )
 
     logger.info(
@@ -323,4 +341,4 @@ async def get_trade_plan(
         plan["entry"], plan.get("current_market_price"),
         plan.get("lot_size"),
     )
-    return plan, price_ok
+    return plan

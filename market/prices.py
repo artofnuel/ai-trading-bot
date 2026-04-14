@@ -1,11 +1,11 @@
 """
 market/prices.py — Live market price fetcher.
 
-Crypto  → Binance public API (no key required, unlimited)
-Forex   → Twelve Data API (free tier, 800 req/day)
+Supports ANY valid trading pair — not limited to a predefined list.
 
-Falls back gracefully if a price cannot be fetched,
-so the bot never crashes — it just warns Claude to estimate.
+Routing logic:
+- Pairs containing USDT, BTC, ETH, SOL, BNB, XRP → Binance
+- All others (Forex, Metals, Indices) → Twelve Data
 """
 
 import logging
@@ -21,36 +21,44 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+
 # ── Pair classification ───────────────────────────────────────────────────────
 
-CRYPTO_KEYWORDS = {"USDT", "BTC", "ETH", "SOL", "BNB", "XRP"}
-
-FOREX_PAIRS = {
-    "EUR/USD", "GBP/USD", "USD/JPY", "GBP/JPY",
-    "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD",
-}
-
-CRYPTO_PAIRS = {
-    "BTC/USDT", "ETH/USDT", "SOL/USDT",
-    "BNB/USDT", "XRP/USDT",
-}
+CRYPTO_KEYWORDS = {"USDT", "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA"}
 
 
 def is_crypto(pair: str) -> bool:
-    pair_upper = pair.upper()
-    return any(kw in pair_upper for kw in CRYPTO_KEYWORDS)
+    """Detect crypto pairs by keyword — supports any crypto pair."""
+    return any(kw in pair.upper() for kw in CRYPTO_KEYWORDS)
 
 
-def normalise(pair: str) -> str:
-    """EUR/USD → EURUSD, BTC/USDT → BTCUSDT"""
+def normalise_binance(pair: str) -> str:
+    """BTC/USDT → BTCUSDT"""
     return pair.replace("/", "").upper()
 
 
-# ── Binance — Crypto prices ───────────────────────────────────────────────────
+def normalise_twelve(pair: str) -> str:
+    """
+    Ensure pair has slash format for Twelve Data.
+    XAUUSD → XAU/USD, EUR/USD → EUR/USD
+    """
+    pair = pair.upper().replace(" ", "")
+    if "/" in pair:
+        return pair
+    # Split 6-char pairs: EURUSD → EUR/USD, XAUUSD → XAU/USD
+    if len(pair) == 6:
+        return pair[:3] + "/" + pair[3:]
+    # Split 7-char pairs: XAGUSD → XAG/USD
+    if len(pair) == 7:
+        return pair[:4] + "/" + pair[4:]
+    return pair
+
+
+# ── Binance — Any crypto pair ─────────────────────────────────────────────────
 
 async def _fetch_binance(pair: str) -> Optional[str]:
-    """Fetch live crypto price from Binance public API. No key needed."""
-    symbol = normalise(pair)
+    """Fetch live crypto price from Binance public API."""
+    symbol = normalise_binance(pair)
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             r = await client.get(BINANCE_PRICE_URL, params={"symbol": symbol})
@@ -58,33 +66,38 @@ async def _fetch_binance(pair: str) -> Optional[str]:
             data = r.json()
             price = data.get("price")
             if price:
-                # Format to reasonable decimal places
                 p = float(price)
-                formatted = f"{p:.2f}" if p > 100 else f"{p:.5f}"
+                # Format based on price magnitude
+                if p >= 10000:
+                    formatted = f"{p:.2f}"
+                elif p >= 100:
+                    formatted = f"{p:.3f}"
+                elif p >= 1:
+                    formatted = f"{p:.4f}"
+                else:
+                    formatted = f"{p:.6f}"
                 logger.info("Binance | %s = %s", symbol, formatted)
                 return formatted
+            else:
+                logger.warning("Binance returned no price for %s: %s", symbol, data)
     except httpx.TimeoutException:
         logger.warning("Binance timeout for %s", symbol)
     except httpx.HTTPStatusError as e:
-        logger.warning("Binance HTTP error for %s: %s", symbol, e.response.status_code)
+        logger.warning("Binance HTTP %s for %s", e.response.status_code, symbol)
     except Exception as e:
-        logger.exception("Binance unexpected error for %s: %s", symbol, e)
+        logger.exception("Binance error for %s: %s", symbol, e)
     return None
 
 
-# ── Twelve Data — Forex prices ────────────────────────────────────────────────
+# ── Twelve Data — Any Forex, Metal, Index pair ────────────────────────────────
 
 async def _fetch_twelve_data(pair: str) -> Optional[str]:
-    """Fetch live Forex price from Twelve Data."""
+    """Fetch live price from Twelve Data — supports Forex, metals, indices."""
     if not TWELVE_DATA_API_KEY:
-        logger.warning("TWELVE_DATA_API_KEY not configured — cannot fetch Forex price for %s", pair)
+        logger.warning("TWELVE_DATA_API_KEY not set — cannot fetch price for %s", pair)
         return None
 
-    # Twelve Data expects EUR/USD format (with slash)
-    symbol = pair.upper()
-    if "/" not in symbol and len(symbol) == 6:
-        symbol = symbol[:3] + "/" + symbol[3:]
-
+    symbol = normalise_twelve(pair)
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             r = await client.get(
@@ -94,28 +107,34 @@ async def _fetch_twelve_data(pair: str) -> Optional[str]:
             r.raise_for_status()
             data = r.json()
 
-            # Twelve Data returns {"price": "1.08432"} on success
-            # or {"status": "error", "message": "..."} on failure
             if data.get("status") == "error":
                 logger.warning(
                     "Twelve Data error for %s: %s",
-                    symbol, data.get("message")
+                    symbol, data.get("message", "unknown error")
                 )
                 return None
 
             price = data.get("price")
             if price:
                 p = float(price)
-                formatted = f"{p:.5f}" if p < 100 else f"{p:.3f}"
+                # Format based on price magnitude
+                if p >= 1000:
+                    formatted = f"{p:.2f}"    # Gold: 2345.67
+                elif p >= 100:
+                    formatted = f"{p:.3f}"    # JPY pairs: 157.832
+                else:
+                    formatted = f"{p:.5f}"    # EUR/USD: 1.08432
                 logger.info("Twelve Data | %s = %s", symbol, formatted)
                 return formatted
+            else:
+                logger.warning("Twelve Data returned no price for %s: %s", symbol, data)
 
     except httpx.TimeoutException:
         logger.warning("Twelve Data timeout for %s", symbol)
     except httpx.HTTPStatusError as e:
-        logger.warning("Twelve Data HTTP error for %s: %s", symbol, e.response.status_code)
+        logger.warning("Twelve Data HTTP %s for %s", e.response.status_code, symbol)
     except Exception as e:
-        logger.exception("Twelve Data unexpected error for %s: %s", symbol, e)
+        logger.exception("Twelve Data error for %s: %s", symbol, e)
     return None
 
 
@@ -123,10 +142,8 @@ async def _fetch_twelve_data(pair: str) -> Optional[str]:
 
 async def fetch_live_price(pair: str) -> Optional[str]:
     """
-    Fetch the current live price for any supported pair.
-
-    Automatically routes to Binance (crypto) or Twelve Data (forex).
-    Returns price as string or None if unavailable.
+    Fetch live price for ANY valid trading pair.
+    Routes automatically to Binance (crypto) or Twelve Data (everything else).
     """
     if is_crypto(pair):
         return await _fetch_binance(pair)
@@ -136,12 +153,13 @@ async def fetch_live_price(pair: str) -> Optional[str]:
 
 async def fetch_all_prices(market: str) -> dict:
     """
-    Fetch live prices for all recommended pairs in the given market.
-    Used when Claude selects the best pair automatically.
-
-    Returns: {"EUR/USD": "1.08432", "GBP/USD": "1.26710", ...}
+    Fetch live prices for default recommended pairs when user
+    has not specified a pair. Claude uses these to pick the best setup.
     """
-    pairs = CRYPTO_PAIRS if market == "Crypto" else FOREX_PAIRS
+    if market == "Crypto":
+        pairs = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+    else:
+        pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "GBP/JPY", "XAU/USD"]
 
     prices = {}
     for pair in pairs:
@@ -149,7 +167,7 @@ async def fetch_all_prices(market: str) -> dict:
         if price:
             prices[pair] = price
         else:
-            logger.warning("Could not fetch live price for %s", pair)
+            logger.warning("Could not fetch price for %s", pair)
 
-    logger.info("Live prices fetched (%d/%d): %s", len(prices), len(pairs), prices)
+    logger.info("Fetched %d/%d prices: %s", len(prices), len(pairs), prices)
     return prices

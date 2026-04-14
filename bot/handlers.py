@@ -36,6 +36,7 @@ from bot.keyboards import (
     risk_keyboard,
     forex_pair_keyboard,
     crypto_pair_keyboard,
+    lot_size_keyboard,
     cancel_keyboard,
 )
 from db.database import (
@@ -49,7 +50,7 @@ from db.database import (
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ───────────────────────────────────────────────────────
-ASK_BALANCE, ASK_MARKET, ASK_PAIR, ASK_RISK, ASK_NOTES, GENERATE = range(6)
+ASK_BALANCE, ASK_MARKET, ASK_PAIR, ASK_RISK, ASK_LOT_SIZE, ASK_NOTES, GENERATE = range(7)
 
 # Key used to store partial trade data in user_data
 TRADE_KEY = "pending_trade"
@@ -309,27 +310,60 @@ async def received_market(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def received_pair(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle pair selection callback or typed pair."""
+    """Handle pair selection callback."""
     query = update.callback_query
     await query.answer()
 
     if query.data == "pair_auto":
         context.user_data[TRADE_KEY]["pair"] = None
         pair_label = "🤖 AI will select the best pair"
+        await query.edit_message_text(
+            f"✅ Pair: *{pair_label}*\n\n⚖️ Choose your *risk appetite*:",
+            parse_mode="Markdown",
+            reply_markup=risk_keyboard(),
+        )
+        return ASK_RISK
+
+    elif query.data == "pair_custom":
+        await query.edit_message_text(
+            "✏️ Type your desired pair (e.g. `XAU/USD`, `EUR/GBP`, `BTC/USDT`):",
+            parse_mode="Markdown",
+        )
+        return ASK_PAIR
+
     elif query.data.startswith("pair_"):
         raw = query.data.replace("pair_", "")
         # Normalise raw codes like EURUSD → EUR/USD
         if "/" not in raw and len(raw) == 6:
             raw = raw[:3] + "/" + raw[3:]
         elif "/" not in raw and len(raw) == 7:
-            raw = raw[:3] + "/" + raw[3:]
+            raw = raw[:4] + "/" + raw[4:]
         context.user_data[TRADE_KEY]["pair"] = raw
-        pair_label = raw
-    else:
-        return ASK_PAIR
+        await query.edit_message_text(
+            f"✅ Pair: *{raw}*\n\n⚖️ Choose your *risk appetite*:",
+            parse_mode="Markdown",
+            reply_markup=risk_keyboard(),
+        )
+        return ASK_RISK
 
-    await query.edit_message_text(
-        f"✅ Pair: *{pair_label}*\n\n⚖️ Choose your *risk appetite*:",
+    return ASK_PAIR
+
+
+async def received_pair_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle manually typed pair (e.g. XAU/USD, EUR/GBP)."""
+    text = update.message.text.strip().upper().replace(" ", "")
+
+    # Normalise to slash format
+    if "/" not in text and len(text) == 6:
+        text = text[:3] + "/" + text[3:]
+    elif "/" not in text and len(text) == 7:
+        text = text[:4] + "/" + text[4:]
+
+    context.user_data[TRADE_KEY]["pair"] = text
+    await update.message.reply_text(
+        f"✅ Pair: *{text}*\n\n⚖️ Choose your *risk appetite*:",
         parse_mode="Markdown",
         reply_markup=risk_keyboard(),
     )
@@ -351,15 +385,74 @@ async def received_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ASK_RISK
 
     context.user_data[TRADE_KEY]["risk"] = risk
-
     risk_emoji = {"conservative": "🛡", "moderate": "⚖️", "aggressive": "🔥"}
+
     await query.edit_message_text(
         f"✅ Risk: *{risk_emoji[risk]} {risk.capitalize()}*\n\n"
-        "📝 Any *additional notes* for Claude? (market outlook, news events, etc.)\n"
-        "Or type *skip* to proceed.",
+        f"📐 What *lot size* would you like to use?\n\n"
+        f"_0.01 is the minimum on most brokers.\n"
+        f"Your lot size determines exact profit and loss amounts._",
+        parse_mode="Markdown",
+        reply_markup=lot_size_keyboard(),
+    )
+    return ASK_LOT_SIZE
+
+
+async def received_lot_size_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle lot size quick-pick selection."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "lot_custom":
+        await query.edit_message_text(
+            "✏️ Type your desired lot size (e.g. `0.03`, `0.15`, `2.00`):",
+            parse_mode="Markdown",
+        )
+        return ASK_LOT_SIZE
+
+    lot = query.data.replace("lot_", "")
+    context.user_data[TRADE_KEY]["lot_size"] = lot
+
+    await query.edit_message_text(
+        f"✅ Lot size: *{lot}*\n\n"
+        f"📝 Any *additional notes*? (e.g. market outlook, news events)\n"
+        f"Or type *skip* to proceed.",
         parse_mode="Markdown",
     )
     return ASK_NOTES
+
+
+async def received_lot_size_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handle manually typed lot size."""
+    text = update.message.text.strip()
+    try:
+        lot = float(text)
+        if lot <= 0:
+            raise ValueError
+        if lot < 0.01:
+            await update.message.reply_text(
+                "⚠️ Minimum lot size is *0.01*. Please enter 0.01 or higher.",
+                parse_mode="Markdown",
+            )
+            return ASK_LOT_SIZE
+        lot_str = f"{lot:.2f}"
+        context.user_data[TRADE_KEY]["lot_size"] = lot_str
+        await update.message.reply_text(
+            f"✅ Lot size: *{lot_str}*\n\n"
+            f"📝 Any *additional notes*? Or type *skip* to proceed.",
+            parse_mode="Markdown",
+        )
+        return ASK_NOTES
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid lot size. Please enter a number like `0.01`, `0.10`, or `1.00`.",
+            parse_mode="Markdown",
+        )
+        return ASK_LOT_SIZE
 
 
 async def received_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -385,6 +478,7 @@ async def _generate_and_send(message: Message, context: ContextTypes.DEFAULT_TYP
     pair = pending.get("pair")
     risk = pending.get("risk", "moderate")
     notes = pending.get("notes", "")
+    lot_size = pending.get("lot_size", "0.01")  # default to 0.01 if not set
     user_id = message.from_user.id
 
     # Guard: ensure we have a balance
@@ -400,21 +494,14 @@ async def _generate_and_send(message: Message, context: ContextTypes.DEFAULT_TYP
     await message.chat.send_action(ChatAction.TYPING)
 
     try:
-        plan, price_ok = await get_trade_plan(
+        plan = await get_trade_plan(
             balance=balance,
             market=market,
             pair=pair,
             risk=risk,
             notes=notes,
+            lot_size=lot_size,
         )
-        
-        # If live price fetch failed, notify the user
-        if not price_ok:
-            await message.reply_text(
-                "⚠️ Notice: Live price fetching failed. Claude is estimating levels based on its training data. "
-                "Please verify prices manually before executing."
-            )
-            
     except AnalystError as exc:
         await thinking_msg.delete()
         await message.reply_text(f"❌ Analysis failed:\n{exc}\n\nPlease try again with /trade.")
@@ -486,6 +573,7 @@ async def handle_natural_language(
         "market": market,
         "pair": pair,
         "risk": risk,
+        "lot_size": "0.01",  # default for NL queries — user can change via /trade
         "notes": "",
     }
 
@@ -523,10 +611,15 @@ def register_handlers(app: Application) -> None:
                 CallbackQueryHandler(received_market, pattern="^market_")
             ],
             ASK_PAIR: [
-                CallbackQueryHandler(received_pair, pattern="^pair_")
+                CallbackQueryHandler(received_pair, pattern="^pair_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, received_pair_text),
             ],
             ASK_RISK: [
                 CallbackQueryHandler(received_risk, pattern="^risk_")
+            ],
+            ASK_LOT_SIZE: [
+                CallbackQueryHandler(received_lot_size_callback, pattern="^lot_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, received_lot_size_text),
             ],
             ASK_NOTES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, received_notes)

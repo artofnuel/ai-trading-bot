@@ -50,6 +50,13 @@ def forex_pair_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("GBP/JPY", callback_data="pair_GBPJPY"),
         ],
         [
+            InlineKeyboardButton("XAU/USD (Gold)", callback_data="pair_XAUUSD"),
+            InlineKeyboardButton("XAG/USD (Silver)", callback_data="pair_XAGUSD"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Type any pair", callback_data="pair_custom"),
+        ],
+        [
             InlineKeyboardButton("🤖 AI picks best pair", callback_data="pair_auto"),
         ],
     ]
@@ -70,7 +77,35 @@ def crypto_pair_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("BNB/USDT", callback_data="pair_BNBUSDT"),
         ],
         [
+            InlineKeyboardButton("✏️ Type any pair", callback_data="pair_custom"),
+        ],
+        [
             InlineKeyboardButton("🤖 AI picks best pair", callback_data="pair_auto"),
+        ],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def lot_size_keyboard() -> InlineKeyboardMarkup:
+    """Quick-pick inline keyboard for lot size selection."""
+    buttons = [
+        [
+            InlineKeyboardButton("0.01 (micro)", callback_data="lot_0.01"),
+            InlineKeyboardButton("0.02", callback_data="lot_0.02"),
+        ],
+        [
+            InlineKeyboardButton("0.05", callback_data="lot_0.05"),
+            InlineKeyboardButton("0.10", callback_data="lot_0.10"),
+        ],
+        [
+            InlineKeyboardButton("0.25", callback_data="lot_0.25"),
+            InlineKeyboardButton("0.50", callback_data="lot_0.50"),
+        ],
+        [
+            InlineKeyboardButton("1.00 (standard)", callback_data="lot_1.00"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Type custom lot size", callback_data="lot_custom"),
         ],
     ]
     return InlineKeyboardMarkup(buttons)
