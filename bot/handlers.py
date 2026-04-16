@@ -1,16 +1,11 @@
 """
-bot/handlers.py — All Telegram command and callback handlers.
+bot/handlers.py — All Telegram command and conversation handlers.
 
-Implements:
-  /start        — welcome message
-  /trade        — step-by-step trade flow OR natural-language shortcut
-  /setbalance   — save a default balance
-  /history      — show last 5 trade plans
-  /help         — usage instructions
-  Natural language — parse free-form trade requests
+Conversation flow:
+  /trade → Balance → Market → Pair → Trade Style → Risk → Lot Size → Notes → Generate
 
-ConversationHandler states:
-  ASK_BALANCE  → ASK_MARKET → ASK_PAIR → ASK_RISK → ASK_NOTES → GENERATE
+Natural language also supported:
+  "I have $500, analyse EUR/USD, aggressive risk, scalp"
 """
 
 import logging
@@ -18,239 +13,132 @@ import re
 from typing import Optional
 
 from telegram import Update, Message
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
 from telegram.constants import ChatAction
+from telegram.ext import (
+    ContextTypes,
+    ConversationHandler,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
 
 from ai.analyst import get_trade_plan, AnalystError
 from bot.formatter import format_trade_plan, format_history_entry
 from bot.keyboards import (
     market_keyboard,
+    trade_style_keyboard,
     risk_keyboard,
     forex_pair_keyboard,
     crypto_pair_keyboard,
     lot_size_keyboard,
     cancel_keyboard,
 )
-from db.database import (
-    get_user,
-    log_trade,
-    get_trade_history,
-    set_user_balance,
-    upsert_user,
-)
+from db.database import get_user, upsert_user, log_trade, get_trade_history
 
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ───────────────────────────────────────────────────────
-ASK_BALANCE, ASK_MARKET, ASK_PAIR, ASK_RISK, ASK_LOT_SIZE, ASK_NOTES, GENERATE = range(7)
 
-# Key used to store partial trade data in user_data
-TRADE_KEY = "pending_trade"
+(
+    ASK_BALANCE,
+    ASK_MARKET,
+    ASK_PAIR,
+    ASK_STYLE,
+    ASK_RISK,
+    ASK_LOT_SIZE,
+    ASK_NOTES,
+    GENERATE,
+) = range(8)
+
+TRADE_KEY = "trade_data"
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a welcome message and register the user."""
     user = update.effective_user
-    await upsert_user(user.id, user.username)
-
-    text = (
+    await upsert_user(user.id, user.username or "")
+    await update.message.reply_text(
         f"👋 Welcome, {user.first_name}!\n\n"
-        "I'm your *AI Trade Planner* — powered by Claude.\n\n"
-        "Here's what I can do:\n"
-        "• Analyse Forex & Crypto markets\n"
-        "• Calculate risk-adjusted position sizing\n"
-        "• Generate entry, stop loss & take profit levels\n"
-        "• Provide trailing stop guidance\n\n"
-        "📌 *Commands*\n"
+        "I'm your *AI Trade Planner* — powered by live market data and Claude AI.\n\n"
+        "I analyse the market in real time and return a complete trade plan:\n"
+        "• Entry, Stop Loss, Take Profits\n"
+        "• Exact lot sizing and risk in dollars\n"
+        "• Scalp or Swing setups\n"
+        "• Live-price anchored levels\n\n"
+        "Commands:\n"
         "/trade — Start a new trade analysis\n"
-        "/setbalance — Set your default account balance\n"
         "/history — View your last 5 trade plans\n"
-        "/help — Full usage guide\n\n"
-        "💡 *Tip:* You can also type naturally, e.g.\n"
-        "_\"I have $1000, analyse BTC/USDT for me, aggressive risk\"_"
+        "/setbalance — Save your default balance\n"
+        "/help — Show this message\n\n"
+        "⚠️ *For educational purposes only. Always verify before trading.*",
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ── /help ─────────────────────────────────────────────────────────────────────
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display full usage instructions."""
-    text = (
-        "📘 *AI Trade Planner — Help*\n\n"
-        "*Commands:*\n"
-        "• /trade — Start a guided trade analysis\n"
-        "• /setbalance <amount> — Save your default balance\n"
-        "  _Example: /setbalance 500_\n"
-        "• /history — See your last 5 generated trade plans\n"
-        "• /help — Show this message\n\n"
-        "*Natural Language:*\n"
-        "Skip the steps and just type something like:\n"
-        "_\"I have $2000, check EUR/USD, moderate risk\"_\n"
-        "_\"$500 account, pick the best crypto pair, conservative\"_\n\n"
-        "*Risk Levels:*\n"
-        "🛡 Conservative — 1% of balance at risk\n"
-        "⚖️ Moderate      — 2% of balance at risk\n"
-        "🔥 Aggressive    — 3% of balance at risk\n\n"
-        "*Note:* This bot advises — you execute manually. Always apply your own judgment."
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await start(update, context)
 
 
 # ── /setbalance ───────────────────────────────────────────────────────────────
 
 async def set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Save the user's default balance. Usage: /setbalance 1000"""
-    user = update.effective_user
-    await upsert_user(user.id, user.username)
-
     args = context.args
     if not args:
         await update.message.reply_text(
-            "⚠️ Please provide an amount.\nExample: `/setbalance 1000`",
-            parse_mode="Markdown",
+            "Usage: `/setbalance 500`", parse_mode="Markdown"
         )
         return
-
-    raw = args[0].replace(",", "").replace("$", "")
     try:
-        balance = float(raw)
+        balance = float(args[0].replace(",", "").replace("$", ""))
         if balance <= 0:
             raise ValueError
-    except ValueError:
+        user_id = update.effective_user.id
+        await upsert_user(user_id, update.effective_user.username or "", default_balance=balance)
         await update.message.reply_text(
-            "❌ Invalid amount. Please enter a positive number.\nExample: `/setbalance 500`",
-            parse_mode="Markdown",
+            f"✅ Default balance saved: *${balance:,.2f}*", parse_mode="Markdown"
         )
-        return
-
-    await set_user_balance(user.id, balance)
-    await update.message.reply_text(
-        f"✅ Default balance saved: *${balance:,.2f}*\n\n"
-        "Use /trade to start your next analysis.",
-        parse_mode="Markdown",
-    )
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ Invalid amount. Use: `/setbalance 500`", parse_mode="Markdown")
 
 
 # ── /history ──────────────────────────────────────────────────────────────────
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display the last 5 trade plans for the user."""
-    user = update.effective_user
-    await upsert_user(user.id, user.username)
-
-    trades = await get_trade_history(user.id, limit=5)
-
+    user_id = update.effective_user.id
+    trades = await get_trade_history(user_id, limit=5)
     if not trades:
-        await update.message.reply_text(
-            "📭 No trade plans found yet.\nUse /trade to generate your first one!"
-        )
+        await update.message.reply_text("📭 No trade history yet. Use /trade to get started.")
         return
-
-    header = f"📋 *Your last {len(trades)} trade plan(s):*\n\n"
-    entries = "\n\n".join(
-        format_history_entry(t, i + 1) for i, t in enumerate(trades)
-    )
-    await update.message.reply_text(header + entries, parse_mode="Markdown")
+    lines = ["📋 *Your last trade plans:*\n"]
+    for i, trade in enumerate(trades, 1):
+        lines.append(format_history_entry(trade, i))
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
-# ── Natural language detection ────────────────────────────────────────────────
-
-def _parse_natural_language(text: str) -> Optional[dict]:
-    """
-    Try to extract trade parameters from a free-form message.
-
-    Returns a dict with keys: balance, market, pair, risk, notes
-    or None if the message doesn't look like a trade request.
-    """
-    text_lower = text.lower()
-
-    # Must mention money or trading intent
-    has_money = bool(re.search(r"\$[\d,]+|[\d,]+\s*(dollar|usd|account|balance)", text_lower))
-    has_intent = any(kw in text_lower for kw in ["trade", "analys", "check", "look at", "forex", "crypto", "pair"])
-
-    if not (has_money or has_intent):
-        return None
-
-    result: dict = {}
-
-    # Extract balance
-    balance_match = re.search(r"\$?([\d,]+(?:\.\d+)?)\s*(?:dollar|usd|account|balance)?", text_lower)
-    if balance_match:
-        try:
-            result["balance"] = float(balance_match.group(1).replace(",", ""))
-        except ValueError:
-            pass
-
-    # Extract market
-    if any(k in text_lower for k in ["crypto", "bitcoin", "btc", "eth", "sol", "usdt"]):
-        result["market"] = "Crypto"
-    elif any(k in text_lower for k in ["forex", "eur", "gbp", "usd", "jpy", "fx"]):
-        result["market"] = "Forex"
-
-    # Extract pair
-    pair_match = re.search(
-        r"\b(EUR/USD|GBP/USD|USD/JPY|GBP/JPY|BTC/USDT|ETH/USDT|SOL/USDT|BNB/USDT"
-        r"|EURUSD|GBPUSD|USDJPY|GBPJPY|BTCUSDT|ETHUSDT|SOLUSDT|BNBUSDT)\b",
-        text,
-        re.IGNORECASE,
-    )
-    if pair_match:
-        raw_pair = pair_match.group(1).upper()
-        # Normalise to slash format
-        if "/" not in raw_pair and len(raw_pair) == 6:
-            raw_pair = raw_pair[:3] + "/" + raw_pair[3:]
-        result["pair"] = raw_pair
-
-    # Extract risk
-    if "conservative" in text_lower or "low risk" in text_lower:
-        result["risk"] = "conservative"
-    elif "aggressive" in text_lower or "high risk" in text_lower:
-        result["risk"] = "aggressive"
-    else:
-        result["risk"] = "moderate"
-
-    return result if result.get("balance") or result.get("market") else None
-
-
-# ── /trade ConversationHandler ────────────────────────────────────────────────
+# ── /trade — conversation entry ───────────────────────────────────────────────
 
 async def trade_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for /trade — ask for balance."""
-    user = update.effective_user
-    await upsert_user(user.id, user.username)
+    context.user_data[TRADE_KEY] = {}
+    user = await get_user(update.effective_user.id)
+    default_balance = user.get("default_balance") if user else None
 
-    # Pre-fill from saved defaults if available
-    db_user = await get_user(user.id)
-    context.user_data[TRADE_KEY] = {
-        "balance": db_user.get("default_balance") if db_user else None,
-        "risk": (db_user.get("default_risk") or "moderate") if db_user else "moderate",
-        "market": None,
-        "pair": None,
-        "notes": "",
-    }
-
-    saved = context.user_data[TRADE_KEY]["balance"]
-    if saved:
-        prompt = (
-            f"💰 Your saved balance is *${saved:,.2f}*.\n\n"
-            "Reply with a new amount to override it, or type *same* to use it."
+    if default_balance:
+        context.user_data[TRADE_KEY]["balance"] = default_balance
+        await update.message.reply_text(
+            f"💰 Using saved balance: *${default_balance:,.2f}*\n\n"
+            f"📊 Which *market* do you want to trade?",
+            parse_mode="Markdown",
+            reply_markup=market_keyboard(),
         )
-    else:
-        prompt = "💰 What is your *account balance*? (e.g. `500` or `$1,200`)"
+        return ASK_MARKET
 
     await update.message.reply_text(
-        prompt,
+        "💰 What is your *account balance* in USD?\n\n"
+        "_Example: 500 or 1000_",
         parse_mode="Markdown",
         reply_markup=cancel_keyboard(),
     )
@@ -258,112 +146,101 @@ async def trade_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def received_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle manual balance input during /trade flow."""
-    text = update.message.text.strip()
-    pending = context.user_data.get(TRADE_KEY, {})
-
-    if text.lower() in ("same", "s", "keep", "ok") and pending.get("balance"):
-        pass  # keep saved balance
-    else:
-        raw = text.replace(",", "").replace("$", "")
-        try:
-            balance = float(raw)
-            if balance <= 0:
-                raise ValueError
-            pending["balance"] = balance
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Please enter a valid positive number, e.g. `500`",
-                parse_mode="Markdown",
-            )
-            return ASK_BALANCE
-
-    context.user_data[TRADE_KEY] = pending
-
-    await update.message.reply_text(
-        "📊 Choose your *market type*:",
-        parse_mode="Markdown",
-        reply_markup=market_keyboard(),
-    )
-    return ASK_MARKET
+    text = update.message.text.strip().replace(",", "").replace("$", "")
+    try:
+        balance = float(text)
+        if balance <= 0:
+            raise ValueError
+        context.user_data[TRADE_KEY]["balance"] = balance
+        await update.message.reply_text(
+            f"✅ Balance: *${balance:,.2f}*\n\n📊 Which *market*?",
+            parse_mode="Markdown",
+            reply_markup=market_keyboard(),
+        )
+        return ASK_MARKET
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid amount. Enter a number like `500` or `1000`.",
+            parse_mode="Markdown",
+        )
+        return ASK_BALANCE
 
 
 async def received_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle market selection callback."""
     query = update.callback_query
     await query.answer()
-
     market_map = {"market_forex": "Forex", "market_crypto": "Crypto"}
     market = market_map.get(query.data)
     if not market:
         return ASK_MARKET
 
     context.user_data[TRADE_KEY]["market"] = market
-
-    pair_kb = forex_pair_keyboard() if market == "Forex" else crypto_pair_keyboard()
+    kb = forex_pair_keyboard() if market == "Forex" else crypto_pair_keyboard()
     await query.edit_message_text(
-        f"✅ Market: *{market}*\n\n🔍 Which *pair* would you like to analyse?",
+        f"✅ Market: *{market}*\n\n🔀 Which *pair*?",
         parse_mode="Markdown",
-        reply_markup=pair_kb,
+        reply_markup=kb,
     )
     return ASK_PAIR
 
 
 async def received_pair(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle pair selection callback."""
     query = update.callback_query
     await query.answer()
 
     if query.data == "pair_auto":
         context.user_data[TRADE_KEY]["pair"] = None
-        pair_label = "🤖 AI will select the best pair"
-        await query.edit_message_text(
-            f"✅ Pair: *{pair_label}*\n\n⚖️ Choose your *risk appetite*:",
-            parse_mode="Markdown",
-            reply_markup=risk_keyboard(),
-        )
-        return ASK_RISK
-
+        pair_label = "🤖 AI selects best pair"
     elif query.data == "pair_custom":
         await query.edit_message_text(
-            "✏️ Type your desired pair (e.g. `XAU/USD`, `EUR/GBP`, `BTC/USDT`):",
+            "✏️ Type your pair (e.g. `XAU/USD`, `EUR/GBP`, `BTC/USDT`):",
             parse_mode="Markdown",
         )
         return ASK_PAIR
-
-    elif query.data.startswith("pair_"):
+    else:
         raw = query.data.replace("pair_", "")
-        # Normalise raw codes like EURUSD → EUR/USD
-        if "/" not in raw and len(raw) == 6:
-            raw = raw[:3] + "/" + raw[3:]
-        elif "/" not in raw and len(raw) == 7:
-            raw = raw[:4] + "/" + raw[4:]
+        if "/" not in raw:
+            if len(raw) == 6:
+                raw = raw[:3] + "/" + raw[3:]
+            elif len(raw) == 7:
+                raw = raw[:4] + "/" + raw[4:]
         context.user_data[TRADE_KEY]["pair"] = raw
-        await query.edit_message_text(
-            f"✅ Pair: *{raw}*\n\n⚖️ Choose your *risk appetite*:",
-            parse_mode="Markdown",
-            reply_markup=risk_keyboard(),
-        )
-        return ASK_RISK
+        pair_label = raw
 
-    return ASK_PAIR
+    await query.edit_message_text(
+        f"✅ Pair: *{pair_label}*\n\n⚡ *Trade style?*",
+        parse_mode="Markdown",
+        reply_markup=trade_style_keyboard(),
+    )
+    return ASK_STYLE
 
 
-async def received_pair_text(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Handle manually typed pair (e.g. XAU/USD, EUR/GBP)."""
+async def received_pair_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle manually typed pair."""
     text = update.message.text.strip().upper().replace(" ", "")
-
-    # Normalise to slash format
-    if "/" not in text and len(text) == 6:
-        text = text[:3] + "/" + text[3:]
-    elif "/" not in text and len(text) == 7:
-        text = text[:4] + "/" + text[4:]
-
+    if "/" not in text:
+        if len(text) == 6:
+            text = text[:3] + "/" + text[3:]
+        elif len(text) == 7:
+            text = text[:4] + "/" + text[4:]
     context.user_data[TRADE_KEY]["pair"] = text
     await update.message.reply_text(
-        f"✅ Pair: *{text}*\n\n⚖️ Choose your *risk appetite*:",
+        f"✅ Pair: *{text}*\n\n⚡ *Trade style?*",
+        parse_mode="Markdown",
+        reply_markup=trade_style_keyboard(),
+    )
+    return ASK_STYLE
+
+
+async def received_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    style_map = {"style_scalp": "scalp", "style_swing": "swing"}
+    style = style_map.get(query.data, "swing")
+    context.user_data[TRADE_KEY]["trade_style"] = style
+    style_label = "⚡ Scalp" if style == "scalp" else "📈 Swing"
+    await query.edit_message_text(
+        f"✅ Style: *{style_label}*\n\n⚖️ *Risk appetite?*",
         parse_mode="Markdown",
         reply_markup=risk_keyboard(),
     )
@@ -371,10 +248,8 @@ async def received_pair_text(
 
 
 async def received_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle risk selection callback."""
     query = update.callback_query
     await query.answer()
-
     risk_map = {
         "risk_conservative": "conservative",
         "risk_moderate": "moderate",
@@ -383,51 +258,38 @@ async def received_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     risk = risk_map.get(query.data)
     if not risk:
         return ASK_RISK
-
     context.user_data[TRADE_KEY]["risk"] = risk
     risk_emoji = {"conservative": "🛡", "moderate": "⚖️", "aggressive": "🔥"}
-
     await query.edit_message_text(
         f"✅ Risk: *{risk_emoji[risk]} {risk.capitalize()}*\n\n"
-        f"📐 What *lot size* would you like to use?\n\n"
-        f"_0.01 is the minimum on most brokers.\n"
-        f"Your lot size determines exact profit and loss amounts._",
+        f"📐 *Lot size?*\n_0.01 is the broker minimum on most platforms._",
         parse_mode="Markdown",
         reply_markup=lot_size_keyboard(),
     )
     return ASK_LOT_SIZE
 
 
-async def received_lot_size_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Handle lot size quick-pick selection."""
+async def received_lot_size_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-
     if query.data == "lot_custom":
         await query.edit_message_text(
-            "✏️ Type your desired lot size (e.g. `0.03`, `0.15`, `2.00`):",
+            "✏️ Type your lot size (e.g. `0.03`, `0.15`, `2.00`):",
             parse_mode="Markdown",
         )
         return ASK_LOT_SIZE
-
     lot = query.data.replace("lot_", "")
     context.user_data[TRADE_KEY]["lot_size"] = lot
-
     await query.edit_message_text(
         f"✅ Lot size: *{lot}*\n\n"
-        f"📝 Any *additional notes*? (e.g. market outlook, news events)\n"
-        f"Or type *skip* to proceed.",
+        f"📝 Any *additional notes*? (e.g. 'bearish bias', 'avoid NFP hour')\n"
+        f"Or type *skip* to generate now.",
         parse_mode="Markdown",
     )
     return ASK_NOTES
 
 
-async def received_lot_size_text(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Handle manually typed lot size."""
+async def received_lot_size_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
     try:
         lot = float(text)
@@ -443,54 +305,140 @@ async def received_lot_size_text(
         context.user_data[TRADE_KEY]["lot_size"] = lot_str
         await update.message.reply_text(
             f"✅ Lot size: *{lot_str}*\n\n"
-            f"📝 Any *additional notes*? Or type *skip* to proceed.",
+            f"📝 Any *additional notes*? Or type *skip* to generate.",
             parse_mode="Markdown",
         )
         return ASK_NOTES
     except ValueError:
         await update.message.reply_text(
-            "❌ Invalid lot size. Please enter a number like `0.01`, `0.10`, or `1.00`.",
+            "❌ Invalid. Enter a number like `0.01`, `0.10`, or `1.00`.",
             parse_mode="Markdown",
         )
         return ASK_LOT_SIZE
 
 
 async def received_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle optional notes and trigger plan generation."""
     text = update.message.text.strip()
-    if text.lower() not in ("skip", "s", "none", "no", "n/a"):
-        context.user_data[TRADE_KEY]["notes"] = text
-    else:
-        context.user_data[TRADE_KEY]["notes"] = ""
-
+    notes = "" if text.lower() == "skip" else text
+    context.user_data[TRADE_KEY]["notes"] = notes
     return await _generate_and_send(update.message, context)
 
 
-async def _generate_and_send(message: Message, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Core generation step: call Claude, format, log, and send the trade plan.
+# ── Natural language handler ──────────────────────────────────────────────────
 
-    Called from both the step-by-step flow and natural language shortcut.
+def _parse_natural_language(text: str) -> Optional[dict]:
     """
-    pending = context.user_data.get(TRADE_KEY, {})
-    balance = pending.get("balance", 0) or 0
-    market = pending.get("market", "Forex")
-    pair = pending.get("pair")
-    risk = pending.get("risk", "moderate")
-    notes = pending.get("notes", "")
-    lot_size = pending.get("lot_size", "0.01")  # default to 0.01 if not set
-    user_id = message.from_user.id
+    Parse a free-text trade request.
+    Handles: balance, market, pair, risk, trade style.
+    """
+    text_lower = text.lower()
 
-    # Guard: ensure we have a balance
-    if not balance or balance <= 0:
-        await message.reply_text(
-            "⚠️ Something went wrong — balance is missing. Please use /trade to start again."
+    # Balance
+    balance_match = re.search(
+        r'\$?([\d,]+(?:\.\d{1,2})?)\s*(?:dollars?|usd)?', text_lower
+    )
+    if not balance_match:
+        return None
+    try:
+        balance = float(balance_match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+    # Market
+    if any(w in text_lower for w in ["crypto", "bitcoin", "btc", "eth", "sol", "usdt"]):
+        market = "Crypto"
+    else:
+        market = "Forex"
+
+    # Pair — look for known pattern like EUR/USD, XAUUSD, BTC/USDT etc.
+    pair_match = re.search(
+        r'\b([A-Za-z]{2,4}[/]?[A-Za-z]{2,4})\b', text
+    )
+    pair = None
+    if pair_match:
+        raw = pair_match.group(1).upper()
+        # Filter out words that match but aren't pairs
+        non_pairs = {"HAVE", "WANT", "NEED", "WITH", "FOR", "AND", "THE"}
+        if raw not in non_pairs and len(raw) >= 5:
+            if "/" not in raw and len(raw) == 6:
+                raw = raw[:3] + "/" + raw[3:]
+            pair = raw
+
+    # Risk
+    if "conservative" in text_lower or "low risk" in text_lower:
+        risk = "conservative"
+    elif "aggressive" in text_lower or "high risk" in text_lower:
+        risk = "aggressive"
+    else:
+        risk = "moderate"
+
+    # Trade style
+    if "scalp" in text_lower or "quick" in text_lower or "fast" in text_lower:
+        trade_style = "scalp"
+    else:
+        trade_style = "swing"
+
+    return {
+        "balance": balance,
+        "market": market,
+        "pair": pair,
+        "risk": risk,
+        "trade_style": trade_style,
+        "lot_size": "0.01",
+        "notes": "",
+    }
+
+
+async def handle_natural_language(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    text = update.message.text.strip()
+    parsed = _parse_natural_language(text)
+    if not parsed:
+        await update.message.reply_text(
+            "I couldn't parse your request. Try:\n"
+            "_\"I have $500, analyse EUR/USD, aggressive risk, scalp\"_\n\n"
+            "Or use /trade to go step by step.",
+            parse_mode="Markdown",
         )
+        return
+
+    context.user_data[TRADE_KEY] = parsed
+    pair_label = parsed["pair"] or "AI picks best pair"
+    style_icon = "⚡" if parsed["trade_style"] == "scalp" else "📈"
+    await update.message.reply_text(
+        f"📋 *Parsed request:*\n"
+        f"Balance : ${parsed['balance']:,.2f}\n"
+        f"Market  : {parsed['market']}\n"
+        f"Pair    : {pair_label}\n"
+        f"Risk    : {parsed['risk'].capitalize()}\n"
+        f"Style   : {style_icon} {parsed['trade_style'].capitalize()}\n\n"
+        f"⏳ Fetching live data and generating plan…",
+        parse_mode="Markdown",
+    )
+    await _generate_and_send(update.message, context)
+
+
+# ── Trade generation ──────────────────────────────────────────────────────────
+
+async def _generate_and_send(
+    message: Message, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    pending = context.user_data.get(TRADE_KEY, {})
+    balance     = pending.get("balance", 0)
+    market      = pending.get("market", "Forex")
+    pair        = pending.get("pair")
+    risk        = pending.get("risk", "moderate")
+    trade_style = pending.get("trade_style", "swing")
+    lot_size    = pending.get("lot_size", "0.01")
+    notes       = pending.get("notes", "")
+    user_id     = message.from_user.id
+
+    if not balance or balance <= 0:
+        await message.reply_text("⚠️ Balance missing. Use /trade to start again.")
         return ConversationHandler.END
 
-    thinking_msg = await message.reply_text(
-        "⏳ Claude is analysing the market… This may take up to 30 seconds."
-    )
+    thinking = await message.reply_text("⏳ Fetching live market data…")
     await message.chat.send_action(ChatAction.TYPING)
 
     try:
@@ -499,108 +447,53 @@ async def _generate_and_send(message: Message, context: ContextTypes.DEFAULT_TYP
             market=market,
             pair=pair,
             risk=risk,
+            trade_style=trade_style,
             notes=notes,
             lot_size=lot_size,
         )
     except AnalystError as exc:
-        await thinking_msg.delete()
-        await message.reply_text(f"❌ Analysis failed:\n{exc}\n\nPlease try again with /trade.")
+        await thinking.delete()
+        await message.reply_text(f"❌ Analysis failed:\n{exc}\n\nTry again with /trade.")
         return ConversationHandler.END
-    except Exception as exc:
-        logger.exception("Unexpected error generating trade plan")
-        await thinking_msg.delete()
-        await message.reply_text(
-            "❌ An unexpected error occurred. Please try again later."
-        )
+    except Exception:
+        logger.exception("Unexpected error generating plan")
+        await thinking.delete()
+        await message.reply_text("❌ Unexpected error. Please try /trade again.")
         return ConversationHandler.END
 
-    # Log to database before sending
     try:
         await log_trade(user_id, plan)
     except Exception:
-        logger.exception("Failed to log trade to database")
+        logger.exception("Failed to log trade to DB")
 
-    # Format and send
-    formatted = format_trade_plan(plan, balance)
-    await thinking_msg.delete()
-    await message.reply_text(formatted)
-
-    # Clean up conversation state
+    await thinking.delete()
+    await message.reply_text(format_trade_plan(plan, balance))
     context.user_data.pop(TRADE_KEY, None)
     return ConversationHandler.END
 
 
-# ── Natural language message handler ─────────────────────────────────────────
-
-async def handle_natural_language(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """
-    Intercept plain messages that look like trade requests and handle them
-    without requiring the full /trade flow.
-    """
-    user = update.effective_user
-    await upsert_user(user.id, user.username)
-
-    text = update.message.text.strip()
-    parsed = _parse_natural_language(text)
-
-    if not parsed:
-        # Not a trade request — give a helpful nudge
-        await update.message.reply_text(
-            "🤔 I'm not sure what you mean. Try /trade for a guided analysis, "
-            "or /help to see how to use me."
-        )
-        return
-
-    # Merge with user defaults for any missing fields
-    db_user = await get_user(user.id)
-    balance = parsed.get("balance") or (db_user.get("default_balance") if db_user else None)
-    if not balance:
-        await update.message.reply_text(
-            "💰 I couldn't find your balance in your message.\n"
-            "Please include it (e.g. *$500*) or set a default with /setbalance.",
-            parse_mode="Markdown",
-        )
-        return
-
-    market = parsed.get("market", "Forex")
-    pair = parsed.get("pair")
-    risk = parsed.get("risk") or (db_user.get("default_risk") if db_user else "moderate")
-
-    context.user_data[TRADE_KEY] = {
-        "balance": balance,
-        "market": market,
-        "pair": pair,
-        "risk": risk,
-        "lot_size": "0.01",  # default for NL queries — user can change via /trade
-        "notes": "",
-    }
-
-    await _generate_and_send(update.message, context)
-
-
-# ── Cancel handler ────────────────────────────────────────────────────────────
+# ── Cancel ────────────────────────────────────────────────────────────────────
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the current /trade conversation."""
-    query = update.callback_query
-    if query:
-        await query.answer()
-        await query.edit_message_text("❌ Trade analysis cancelled. Use /trade to start again.")
+    context.user_data.pop(TRADE_KEY, None)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("❌ Trade analysis cancelled.")
     else:
         await update.message.reply_text("❌ Cancelled. Use /trade to start again.")
-
-    context.user_data.pop(TRADE_KEY, None)
     return ConversationHandler.END
 
 
-# ── Application registration ──────────────────────────────────────────────────
+# ── Register all handlers ─────────────────────────────────────────────────────
 
-def register_handlers(app: Application) -> None:
-    """Attach all handlers to the Application instance."""
+def register_handlers(app) -> None:
+    # Simple commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("setbalance", set_balance))
+    app.add_handler(CommandHandler("history", history))
 
-    # /trade conversation
+    # Trade conversation
     trade_conv = ConversationHandler(
         entry_points=[CommandHandler("trade", trade_start)],
         states={
@@ -613,6 +506,9 @@ def register_handlers(app: Application) -> None:
             ASK_PAIR: [
                 CallbackQueryHandler(received_pair, pattern="^pair_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, received_pair_text),
+            ],
+            ASK_STYLE: [
+                CallbackQueryHandler(received_style, pattern="^style_")
             ],
             ASK_RISK: [
                 CallbackQueryHandler(received_risk, pattern="^risk_")
@@ -630,16 +526,10 @@ def register_handlers(app: Application) -> None:
             CommandHandler("cancel", cancel),
         ],
         allow_reentry=True,
-        per_message=False,
     )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("setbalance", set_balance))
-    app.add_handler(CommandHandler("history", history))
     app.add_handler(trade_conv)
 
-    # Natural language fallback — catches any non-command text outside a conversation
+    # Natural language fallback — catches any free-text message outside conversation
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_language)
     )

@@ -1,9 +1,12 @@
 """
 ai/analyst.py — Claude AI integration for generating trade plans.
 
-Always fetches live market prices before calling Claude so that
-all entry, SL, TP, and execution type values are anchored to
-real current market conditions — never estimated from training data.
+Fetches live market prices before calling Claude so all levels
+are anchored to real current market conditions.
+
+Trade styles supported:
+  - swing  : multi-session trades, larger TP targets
+  - scalp  : intra-session trades, tight SL/TP, quick R:R
 """
 
 import asyncio
@@ -26,107 +29,62 @@ class AnalystError(Exception):
     """Raised when the AI analyst cannot produce a valid trade plan."""
 
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── System prompt — lean and non-redundant ────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an elite forex and crypto trade analyst with deep expertise in Smart Money \
-Concepts (SMC), ICT methodology, technical analysis, and risk management.
+You are an elite Forex and Crypto trade analyst specialising in Smart Money Concepts \
+(SMC), ICT methodology, and disciplined risk management.
 
-You will ALWAYS be given the current live market price. All trade levels you generate \
-MUST be anchored to this real price. Never invent or estimate prices — use only what \
-is provided as your starting point.
+Return STRICT JSON only — no markdown, no explanation outside the JSON object.
 
-Return STRICT JSON only — no markdown, no preamble, no text outside the JSON object.
+EXECUTION TYPE — derive from live price vs entry:
+  BUY:  live > entry → Buy Limit | live < entry → Buy Stop | live = entry → Buy Market
+  SELL: live < entry → Sell Limit | live > entry → Sell Stop | live = entry → Sell Market
 
-════════════════════════════════════════
-EXECUTION TYPE RULES — NON-NEGOTIABLE
-════════════════════════════════════════
-Always derive the order type from the relationship between
-current live price and your chosen entry price.
+LOT SIZE — use EXACTLY what the trader specifies. Do not change it.
+  Pip values per standard lot: USD pairs $10/pip | JPY pairs ~$8/pip | XAU/USD $10/pip per 0.1 lot
+  Crypto PnL = price_difference × lot_size
+  All dollar figures must be mathematically exact. No approximations.
 
-SELL trades:
-  - Live price BELOW entry → price must rise to entry → "Sell Limit"
-  - Live price ABOVE entry → price must fall to entry → "Sell Stop"
-  - Live price AT entry    → "Sell Market"
+TRADE STYLE:
+  swing : 3 TPs, wider SL, multi-session outlook, confluence score ≥ 7
+  scalp : 2 TPs only, SL ≤ 15 pips (Forex) or ≤ 0.3% (Crypto), quick R:R ≥ 1:1.5, \
+entry near current price, best during active session killzones
 
-BUY trades:
-  - Live price ABOVE entry → price must fall to entry → "Buy Limit"
-  - Live price BELOW entry → price must rise to entry → "Buy Stop"
-  - Live price AT entry    → "Buy Market"
-
-Never guess. Always calculate from the live price provided.
-
-════════════════════════════════════════
-LOT SIZE AND CALCULATION RULES
-════════════════════════════════════════
-The trader specifies their own lot size in the user prompt.
-Use EXACTLY that lot size — do not change, round, or override it.
-Set minimum_lot_warning to false always (trader chose their size).
-
-Calculate ALL values with mathematical precision:
-- risk_amount: exact dollar loss if SL is hit at specified lot size
-- risk_percent: (risk_amount ÷ balance) × 100, to 2 decimal places
-- estimated_profit_at_tp1/2/3: exact profit from that partial close
-- total_potential_profit: exact sum of all three partial profits
-- pip_value: exact pip value at the specified lot size
-
-No rounding. No approximations. Real numbers only.
-
-════════════════════════════════════════
-MT5 SETUP
-════════════════════════════════════════
-- Include mt5_setup for Forex only. Set null for Crypto.
-- symbol: remove slash (EUR/USD → EURUSD)
-- order_type must match execution field exactly
-- volume = lot_size
-- tp = TP1 price only (trader manages TP2/TP3 manually)
-
-════════════════════════════════════════
-REQUIRED JSON SCHEMA
-════════════════════════════════════════
+JSON schema (follow exactly):
 {
-  "pair": "EUR/USD",
+  "pair": "XAU/USD",
   "direction": "BUY",
-  "current_market_price": "1.08231",
-  "execution": "Buy Limit",
-  "entry": "1.07950",
-  "stop_loss": "1.07450",
-  "stop_loss_pips": 50,
-  "lot_size": "0.02",
+  "trade_style": "scalp",
+  "current_market_price": "2345.50",
+  "execution": "Buy Stop",
+  "entry": "2346.00",
+  "stop_loss": "2343.50",
+  "stop_loss_pips": 25,
+  "lot_size": "0.01",
   "pip_value": "$0.10 per pip",
-  "minimum_lot_warning": false,
-  "risk_amount": "$10.00",
-  "risk_percent": 2,
+  "risk_amount": "$2.50",
+  "risk_percent": 2.50,
   "take_profits": [
-    {"label": "TP1", "price": "1.08450", "pips": 50,  "rr": "1:1",   "partial_close": "40%"},
-    {"label": "TP2", "price": "1.08950", "pips": 100, "rr": "1:2",   "partial_close": "30%"},
-    {"label": "TP3", "price": "1.09700", "pips": 175, "rr": "1:3.5", "partial_close": "30%"}
+    {"label": "TP1", "price": "2349.50", "pips": 35, "rr": "1:1.4", "partial_close": "50%"},
+    {"label": "TP2", "price": "2353.00", "pips": 70, "rr": "1:2.8", "partial_close": "50%"}
   ],
-  "estimated_profit_at_tp1": "$4.00",
-  "estimated_profit_at_tp2": "$6.00",
-  "estimated_profit_at_tp3": "$10.50",
-  "total_potential_profit": "$20.50",
+  "estimated_profit_at_tp1": "$1.75",
+  "estimated_profit_at_tp2": "$3.50",
+  "total_potential_profit": "$5.25",
   "trailing_stop": {
     "recommended": true,
     "activate_at": "TP1",
-    "trail_distance": "30 pips",
-    "rationale": "Activate after TP1 hit to lock in profit while trade runs toward TP2/TP3."
+    "trail_distance": "15 pips",
+    "rationale": "Trail after TP1 to protect profit while targeting TP2."
   },
   "confluence_score": 8,
   "session": "London Open",
-  "mt5_setup": {
-    "symbol": "EURUSD",
-    "order_type": "Buy Limit",
-    "volume": "0.02",
-    "price": "1.07950",
-    "sl": "1.07450",
-    "tp": "1.08450",
-    "comment": "AI-TradeBot TP1",
-    "note": "For TP2 and TP3, place additional pending orders at same entry with reduced volume. Or set TP1 only and move SL to entry after TP1 hits."
-  },
-  "rationale": "Detailed multi-sentence analysis covering market structure, SMC reasoning, and why this setup is valid right now based on the live price provided.",
-  "caution": "Specific invalidation level or risk the trader must watch."
+  "rationale": "Concise 2-3 sentence SMC/ICT analysis explaining the setup based on the live price.",
+  "caution": "One sentence — specific invalidation level or key risk."
 }
+
+For swing trades include 3 take_profits. For scalp trades include 2 take_profits only.
 """
 
 
@@ -137,93 +95,59 @@ def _build_user_prompt(
     market: str,
     pair: Optional[str],
     risk: str,
+    trade_style: str,
     notes: str,
     live_price: Optional[str],
     pair_prices: Optional[dict],
-    lot_size: str = "0.01",
+    lot_size: str,
 ) -> str:
     risk_map = {"conservative": 1, "moderate": 2, "aggressive": 3}
     risk_pct = risk_map.get(risk.lower(), 2)
-    risk_amount = balance * risk_pct / 100
+    lot = float(lot_size)
+    pip_val = lot * 10  # USD pairs baseline
 
-    lot_size_section = f"""\
-Lot Size (USER SPECIFIED): {lot_size}
-This is the EXACT lot size the trader wants to use. Do not change it.
-Do not round it. Do not suggest a different size.
-
-EXACT PROFIT AND LOSS CALCULATIONS — NO ROUNDING, NO ESTIMATING:
-Use the trader's specified lot size of {lot_size} for all calculations.
-
-For Forex pairs:
-  - Standard pip value = $10 per pip per 1.00 lot
-  - Pip value at {lot_size} lots = ${float(lot_size) * 10:.4f} per pip
-  - For JPY pairs pip value = ~$7.00 per pip per lot (use current rate to be precise)
-  - For XAU/USD (Gold): 1 pip = $0.01 price move, pip value = $1.00 per 0.01 lot
-  - Loss if SL hit = SL pips × pip value at specified lot size
-  - Profit at each TP = TP pips × pip value × partial close percentage
-
-For Crypto pairs:
-  - Position value = lot size × current price
-  - PnL = price difference × lot size
-  - Calculate exactly, no approximations
-
-DO NOT use minimum lot enforcement — the trader has chosen their lot size.
-DO NOT warn about minimum lots — trader is aware.
-Calculate risk_amount and risk_percent from the ACTUAL specified lot size.
-Calculate ALL profit figures from the ACTUAL specified lot size.
-Every number must be mathematically exact based on live price and specified lot size.
-"""
-
-    # ── Pair and price section ────────────────────────────────
+    # Price block
     if pair:
-        pair_line = f"Trading Pair    : {pair.upper()}"
+        pair_line = f"Pair     : {pair.upper()}"
         if live_price:
-            price_section = (
-                f"Current Live Price : {live_price}\n"
-                f"⚠️  This is the REAL current market price fetched right now.\n"
-                f"    All levels MUST be calculated relative to this price.\n"
-                f"    Derive execution type from: live price vs entry relationship."
+            price_block = (
+                f"Live Price : {live_price} ← REAL price fetched now. "
+                f"Anchor ALL levels to this. Derive execution from live vs entry."
             )
         else:
-            price_section = (
-                "Current Live Price : UNAVAILABLE (API fetch failed)\n"
-                "⚠️  Use your best current market knowledge to estimate price.\n"
-                "    Clearly state your estimated price in current_market_price field.\n"
-                "    Flag this uncertainty in the caution field."
+            price_block = (
+                "Live Price : UNAVAILABLE — estimate from market knowledge. "
+                "State estimate in current_market_price. Flag in caution."
             )
     else:
-        pair_line = "Trading Pair    : AI selects best opportunity"
+        pair_line = "Pair     : AI selects best opportunity"
         if pair_prices:
-            prices_formatted = "\n".join(
-                f"    {p:<12}: {v}" for p, v in pair_prices.items()
-            )
-            price_section = (
-                f"Live Prices (fetched RIGHT NOW):\n"
-                f"{prices_formatted}\n"
-                f"Select the pair with the strongest current setup.\n"
-                f"Use the live price of your selected pair as the anchor for all levels."
+            prices_str = " | ".join(f"{p}={v}" for p, v in pair_prices.items())
+            price_block = (
+                f"Live Prices: {prices_str}\n"
+                f"Pick the strongest setup. Use chosen pair's live price as anchor."
             )
         else:
-            price_section = (
-                "Current Prices  : UNAVAILABLE (API fetch failed)\n"
-                "Use your best market knowledge. State estimated price in current_market_price."
-            )
+            price_block = "Live Prices: UNAVAILABLE — use market knowledge."
 
-    return f"""\
-Generate a trade plan for the following:
+    scalp_note = (
+        "\nSCALP MODE: Keep SL ≤ 15 pips (Forex) / ≤ 0.3% (Crypto). "
+        "Entry must be within 10 pips of live price. 2 TPs only. Fast setup."
+        if trade_style == "scalp" else ""
+    )
 
-Account Balance : ${balance:,.2f}
-Market          : {market}
-{pair_line}
-Risk Appetite   : {risk.capitalize()} ({risk_pct}% = ${risk_amount:,.2f} at risk)
-Additional Notes: {notes or 'None'}
-
-{lot_size_section}
-
-{price_section}
-
-Return ONLY the JSON object. No markdown, no extra text.
-"""
+    return (
+        f"Balance  : ${balance:,.2f}\n"
+        f"Market   : {market}\n"
+        f"{pair_line}\n"
+        f"Risk     : {risk.capitalize()} ({risk_pct}% = ${balance * risk_pct / 100:,.2f})\n"
+        f"Lot Size : {lot_size} (exact — do not change)\n"
+        f"Pip Val  : ~${pip_val:.3f}/pip at this lot size (adjust for pair type)\n"
+        f"Style    : {trade_style.upper()}{scalp_note}\n"
+        f"Notes    : {notes or 'None'}\n\n"
+        f"{price_block}\n\n"
+        f"Return ONLY the JSON object."
+    )
 
 
 # ── Main function ─────────────────────────────────────────────────────────────
@@ -233,45 +157,38 @@ async def get_trade_plan(
     market: str,
     pair: Optional[str] = None,
     risk: str = "moderate",
+    trade_style: str = "swing",
     notes: str = "",
     lot_size: str = "0.01",
 ) -> dict:
     """
-    Fetch live market price then call Claude to generate
-    a trade plan anchored to real current market conditions.
+    Fetch live price then generate a trade plan with Claude.
+    trade_style: 'swing' or 'scalp'
     """
 
-    # ── Step 1: Fetch live price(s) ───────────────────────────
+    # Step 1 — Fetch live price(s)
     live_price: Optional[str] = None
     pair_prices: dict = {}
-    price_ok = False
 
     if pair:
-        logger.info("Fetching live price for %s...", pair)
+        logger.info("Fetching live price: %s", pair)
         live_price = await fetch_live_price(pair)
         if live_price:
-            logger.info("Live price confirmed: %s = %s", pair, live_price)
-            price_ok = True
+            logger.info("Live price: %s = %s", pair, live_price)
         else:
-            logger.warning(
-                "Live price unavailable for %s — Claude will estimate. "
-                "Check API keys and connectivity.", pair
-            )
+            logger.warning("Price fetch failed for %s — Claude will estimate", pair)
     else:
-        logger.info("No pair specified — fetching all %s prices...", market)
+        logger.info("Fetching all %s prices for AI selection", market)
         pair_prices = await fetch_all_prices(market)
-        if pair_prices:
-            logger.info("Live prices ready: %s", pair_prices)
-            price_ok = True
-        else:
-            logger.warning("No live prices available — Claude will estimate all levels.")
+        logger.info("Prices: %s", pair_prices)
 
-    # ── Step 2: Build prompt ──────────────────────────────────
+    # Step 2 — Build prompt
     user_prompt = _build_user_prompt(
         balance=balance,
         market=market,
         pair=pair,
         risk=risk,
+        trade_style=trade_style,
         notes=notes,
         live_price=live_price,
         pair_prices=pair_prices,
@@ -279,13 +196,12 @@ async def get_trade_plan(
     )
 
     logger.info(
-        "Calling Claude | model=%s market=%s pair=%s risk=%s balance=%.2f live_price=%s",
-        CLAUDE_MODEL, market, pair, risk, balance, live_price or "N/A"
+        "Claude call | model=%s pair=%s style=%s lot=%s live=%s",
+        CLAUDE_MODEL, pair or "AI", trade_style, lot_size, live_price or "N/A"
     )
 
-    # ── Step 3: Call Claude (in executor — SDK is synchronous) ─
+    # Step 3 — Call Claude (executor — SDK is sync)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     try:
         loop = asyncio.get_event_loop()
         message = await loop.run_in_executor(
@@ -299,46 +215,38 @@ async def get_trade_plan(
             ),
         )
     except anthropic.APITimeoutError:
-        raise AnalystError("Claude timed out. Please try again in a moment.")
+        raise AnalystError("Claude timed out. Please try again.")
     except anthropic.APIConnectionError as e:
-        raise AnalystError(f"Connection error reaching Claude: {e}")
+        raise AnalystError(f"Connection error: {e}")
     except anthropic.RateLimitError:
-        raise AnalystError("Rate limit reached. Please wait a moment and try again.")
+        raise AnalystError("Rate limit hit. Wait a moment and try again.")
     except anthropic.APIStatusError as e:
         raise AnalystError(f"Claude API error {e.status_code}: {e.message}")
 
-    # ── Step 4: Parse response ────────────────────────────────
+    # Step 4 — Parse
     raw: str = message.content[0].text.strip()
-    logger.debug("Claude raw response (first 400 chars): %s", raw[:400])
-
-    # Strip accidental markdown fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
     try:
         plan: dict = json.loads(raw)
     except json.JSONDecodeError as e:
-        logger.error("JSON parse failed. Raw: %s", raw[:500])
-        raise AnalystError(
-            f"Claude returned an unexpected format. Please try again. (Detail: {e})"
-        )
+        logger.error("JSON parse failed: %s", raw[:400])
+        raise AnalystError(f"Unexpected format from Claude. Try again. ({e})")
 
-    # ── Step 5: Validate required fields ─────────────────────
-    required_keys = {
-        "pair", "direction", "current_market_price", "execution",
-        "entry", "stop_loss", "take_profits", "rationale",
-        "lot_size", "total_potential_profit", "minimum_lot_warning",
+    # Step 5 — Validate
+    required = {
+        "pair", "direction", "trade_style", "current_market_price",
+        "execution", "entry", "stop_loss", "take_profits",
+        "lot_size", "risk_amount", "total_potential_profit", "rationale",
     }
-    missing = required_keys - plan.keys()
+    missing = required - plan.keys()
     if missing:
-        raise AnalystError(
-            f"Claude response missing required fields: {', '.join(missing)}"
-        )
+        raise AnalystError(f"Claude response missing: {', '.join(missing)}")
 
     logger.info(
-        "Trade plan ready | %s %s | entry=%s | live_price=%s | lot=%s",
-        plan["direction"], plan["pair"],
-        plan["entry"], plan.get("current_market_price"),
-        plan.get("lot_size"),
+        "Plan ready | %s %s %s | entry=%s live=%s lot=%s",
+        plan["trade_style"].upper(), plan["direction"], plan["pair"],
+        plan["entry"], plan.get("current_market_price"), plan.get("lot_size"),
     )
     return plan

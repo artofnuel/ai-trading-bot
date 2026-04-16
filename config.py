@@ -14,12 +14,11 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL: str = "claude-sonnet-4-6"
 CLAUDE_TIMEOUT: int = 30
-CLAUDE_MAX_TOKENS: int = 2048
+CLAUDE_MAX_TOKENS: int = 1024  # JSON response rarely exceeds 800 tokens
 
 # ── Database ──────────────────────────────────────────────────────────────────
-import os as _os
-_BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
-DATABASE_PATH: str = _os.path.join(_BASE_DIR, "trade_bot.db")
+BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+DATABASE_PATH: str = os.path.join(BASE_DIR, "trade_bot.db")
 
 # ── Market Data ───────────────────────────────────────────────────────────────
 TWELVE_DATA_API_KEY: str = os.getenv("TWELVE_DATA_API_KEY", "")
