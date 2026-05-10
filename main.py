@@ -5,7 +5,6 @@ Initialises the database, builds the Application, registers all handlers,
 and starts polling.
 """
 
-import asyncio
 import logging
 
 from telegram.ext import Application

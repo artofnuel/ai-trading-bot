@@ -1,15 +1,8 @@
 """
-bot/keyboards.py — All inline keyboard definitions.
+bot/keyboards.py — All inline keyboard definitions. Forex only.
 """
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-
-def market_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("💱 Forex", callback_data="market_forex"),
-        InlineKeyboardButton("₿ Crypto", callback_data="market_crypto"),
-    ]])
 
 
 def trade_style_keyboard() -> InlineKeyboardMarkup:
@@ -42,26 +35,15 @@ def forex_pair_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("GBP/JPY", callback_data="pair_GBPJPY"),
         ],
         [
-            InlineKeyboardButton("XAU/USD (Gold)", callback_data="pair_XAUUSD"),
-            InlineKeyboardButton("XAG/USD (Silver)", callback_data="pair_XAGUSD"),
-        ],
-        [InlineKeyboardButton("✏️ Type any pair", callback_data="pair_custom")],
-        [InlineKeyboardButton("🤖 AI picks best pair", callback_data="pair_auto")],
-    ])
-
-
-def crypto_pair_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("BTC/USDT", callback_data="pair_BTCUSDT"),
-            InlineKeyboardButton("ETH/USDT", callback_data="pair_ETHUSDT"),
+            InlineKeyboardButton("XAU/USD  (Gold)", callback_data="pair_XAUUSD"),
+            InlineKeyboardButton("XAG/USD  (Silver)", callback_data="pair_XAGUSD"),
         ],
         [
-            InlineKeyboardButton("SOL/USDT", callback_data="pair_SOLUSDT"),
-            InlineKeyboardButton("BNB/USDT", callback_data="pair_BNBUSDT"),
+            InlineKeyboardButton("EUR/GBP",  callback_data="pair_EURGBP"),
+            InlineKeyboardButton("AUD/USD",  callback_data="pair_AUDUSD"),
         ],
-        [InlineKeyboardButton("✏️ Type any pair", callback_data="pair_custom")],
-        [InlineKeyboardButton("🤖 AI picks best pair", callback_data="pair_auto")],
+        [InlineKeyboardButton("✏️ Type any Forex pair", callback_data="pair_custom")],
+        [InlineKeyboardButton("🤖 AI picks best opportunity", callback_data="pair_auto")],
     ])
 
 
@@ -69,15 +51,15 @@ def lot_size_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("0.01 (micro)", callback_data="lot_0.01"),
-            InlineKeyboardButton("0.02", callback_data="lot_0.02"),
+            InlineKeyboardButton("0.02",         callback_data="lot_0.02"),
         ],
         [
-            InlineKeyboardButton("0.05", callback_data="lot_0.05"),
-            InlineKeyboardButton("0.10", callback_data="lot_0.10"),
+            InlineKeyboardButton("0.05",         callback_data="lot_0.05"),
+            InlineKeyboardButton("0.10",         callback_data="lot_0.10"),
         ],
         [
-            InlineKeyboardButton("0.25", callback_data="lot_0.25"),
-            InlineKeyboardButton("0.50", callback_data="lot_0.50"),
+            InlineKeyboardButton("0.25",         callback_data="lot_0.25"),
+            InlineKeyboardButton("0.50",         callback_data="lot_0.50"),
         ],
         [InlineKeyboardButton("1.00 (standard)", callback_data="lot_1.00")],
         [InlineKeyboardButton("✏️ Type custom lot size", callback_data="lot_custom")],

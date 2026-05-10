@@ -1,12 +1,13 @@
 """
 bot/formatter.py — Convert a Claude trade plan dict into a clean Telegram message.
 
-Changes from previous version:
-  - MT5 setup section removed
-  - Scalp vs swing layout awareness (scalp = 2 TPs, swing = 3 TPs)
-  - Fixed crypto detection (covers XRP, DOGE, ADA, USDT pairs)
-  - Single datetime import at top
-  - Removed redundant _wrap utility (unused)
+v2 additions:
+  - PDH/PDL display
+  - Kill zone status
+  - HTF bias line
+  - Confluence breakdown (weighted factors)
+  - Math check field shown for transparency
+  - Crypto removed
 """
 
 from datetime import datetime, timezone
@@ -18,12 +19,6 @@ def _direction_emoji(direction: str) -> str:
     return "🟢" if direction.upper() == "BUY" else "🔴"
 
 
-CRYPTO_KEYWORDS = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "USDT"}
-
-def _is_crypto(pair: str) -> bool:
-    return any(kw in pair.upper() for kw in CRYPTO_KEYWORDS)
-
-
 # ── Main formatter ────────────────────────────────────────────────────────────
 
 def format_trade_plan(plan: dict, balance: float) -> str:
@@ -32,6 +27,8 @@ def format_trade_plan(plan: dict, balance: float) -> str:
     trade_style = plan.get("trade_style", "swing").upper()
     dir_emoji   = _direction_emoji(direction)
     style_emoji = "⚡" if trade_style == "SCALP" else "📈"
+    kz_active   = plan.get("kill_zone_active", False)
+    kz_icon     = "✅" if kz_active else "⏳"
 
     lines = []
 
@@ -40,8 +37,27 @@ def format_trade_plan(plan: dict, balance: float) -> str:
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"Direction   : {dir_emoji} {direction}")
     lines.append(f"Execution   : {plan.get('execution', 'N/A')}")
-    lines.append(f"Session     : {plan.get('session', 'N/A')}")
+    lines.append(f"Session     : {plan.get('session', 'N/A')}  {kz_icon} {'Kill Zone' if kz_active else 'Outside KZ'}")
     lines.append(f"Confluence  : ⭐ {plan.get('confluence_score', 'N/A')}/10")
+
+    # ── HTF Bias ──────────────────────────────────────────────
+    htf_bias = plan.get("htf_bias")
+    if htf_bias:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🧭 HTF BIAS")
+        lines.append(htf_bias)
+
+    # ── Key Levels (PDH/PDL) ──────────────────────────────────
+    key_levels = plan.get("key_levels", {})
+    if key_levels:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🗝 KEY LEVELS")
+        if key_levels.get("pdh"):
+            lines.append(f"PDH (Liquidity) : {key_levels['pdh']}")
+        if key_levels.get("pdl"):
+            lines.append(f"PDL (Liquidity) : {key_levels['pdl']}")
+        if key_levels.get("entry_rationale"):
+            lines.append(f"Entry Reason    : {key_levels['entry_rationale']}")
 
     # ── Account ───────────────────────────────────────────────
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -68,17 +84,11 @@ def format_trade_plan(plan: dict, balance: float) -> str:
     # ── Take Profits ──────────────────────────────────────────
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("🎯 TAKE PROFITS")
-
-    tp_profit_keys = [
-        "estimated_profit_at_tp1",
-        "estimated_profit_at_tp2",
-        "estimated_profit_at_tp3",
-    ]
-    for i, tp in enumerate(plan.get("take_profits", [])):
-        profit = plan.get(tp_profit_keys[i], "N/A") if i < len(tp_profit_keys) else "N/A"
+    for tp in plan.get("take_profits", []):
+        profit = tp.get("profit", "N/A")
         lines.append(
             f"{tp['label']} → {tp['price']} | {tp.get('rr', 'N/A'):>6} "
-            f"| Close {tp.get('partial_close', 'N/A')} → Est: {profit}"
+            f"| Close {tp.get('partial_close', 'N/A')} → {profit}"
         )
     lines.append(f"Total if all TPs hit → {plan.get('total_potential_profit', 'N/A')}")
 
@@ -87,10 +97,31 @@ def format_trade_plan(plan: dict, balance: float) -> str:
     if ts and ts.get("recommended"):
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         lines.append("🔁 TRAILING STOP")
+        trail_pips = ts.get("trail_distance_pips", ts.get("trail_distance", "N/A"))
         lines.append(
-            f"Activate at {ts.get('activate_at')} → Trail {ts.get('trail_distance')}"
+            f"Activate at {ts.get('activate_at')} → Trail {trail_pips} pips"
         )
         lines.append(ts.get("rationale", ""))
+
+    # ── Confluence Breakdown ───────────────────────────────────
+    breakdown = plan.get("confluence_breakdown", {})
+    if breakdown:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("⭐ CONFLUENCE BREAKDOWN")
+        label_map = {
+            "htf_structure":   "HTF Structure",
+            "kill_zone":       "Kill Zone",
+            "ob_fvg":          "OB / FVG at entry",
+            "liquidity_swept": "Liquidity swept",
+            "premium_discount":"Premium/Discount zone",
+            "bos_choch":       "BOS / CHoCH",
+            "atr_sl_room":     "ATR SL validity",
+            "rr_quality":      "R:R quality",
+        }
+        for key, label in label_map.items():
+            val = breakdown.get(key, 0)
+            bar = "█" * int(val * 2)
+            lines.append(f"{label:<22}: {val:.1f}  {bar}")
 
     # ── Analysis ──────────────────────────────────────────────
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -101,6 +132,13 @@ def format_trade_plan(plan: dict, balance: float) -> str:
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("⚠️  CAUTION")
     lines.append(plan.get("caution", "N/A"))
+
+    # ── Math Check ────────────────────────────────────────────
+    math_check = plan.get("math_check")
+    if math_check:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🔢 MATH VERIFIED")
+        lines.append(math_check)
 
     # ── Timestamp ─────────────────────────────────────────────
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -114,7 +152,6 @@ def format_trade_plan(plan: dict, balance: float) -> str:
 # ── History formatter ─────────────────────────────────────────────────────────
 
 def format_history_entry(trade: dict, index: int) -> str:
-    """Format a single trade history row into a compact Telegram summary."""
     pair      = (trade.get("pair") or "N/A").upper()
     direction = (trade.get("direction") or "N/A").upper()
     entry     = trade.get("entry") or "N/A"
