@@ -14,7 +14,7 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL: str = "claude-sonnet-4-6"
 CLAUDE_TIMEOUT: int = 45          # Raised: richer prompt needs more time
-CLAUDE_MAX_TOKENS: int = 1200     # Raised: enriched JSON output
+CLAUDE_MAX_TOKENS: int = 2500     # Raised: large JSON output needs sufficient tokens
 
 # ── Database ──────────────────────────────────────────────────────────────────
 BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
