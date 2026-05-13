@@ -433,7 +433,11 @@ async def _generate_and_send(
         logger.exception("Failed to log trade to DB")
 
     await thinking.delete()
-    await message.reply_text(format_trade_plan(plan, balance))
+
+    messages = format_trade_plan(plan, balance)
+    await message.reply_text(messages[0], parse_mode="Markdown")
+    await message.reply_text(messages[1], parse_mode="Markdown")
+
     context.user_data.pop(TRADE_KEY, None)
     return ConversationHandler.END
 

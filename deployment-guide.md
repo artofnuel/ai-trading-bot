@@ -118,11 +118,20 @@ sudo journalctl -u tradingbot -f
 
 ## Quick Reference — Common systemd Commands
 
-| Command | Purpose |
-|---|---|
-| `sudo systemctl restart tradingbot` | Restart the bot |
-| `sudo systemctl stop tradingbot` | Stop the bot |
-| `sudo systemctl start tradingbot` | Start the bot |
-| `sudo systemctl status tradingbot` | Show status & recent logs |
-| `sudo journalctl -u tradingbot -f` | Follow live logs |
-| `sudo journalctl -u tradingbot --since "5 min ago"` | Show last 5 minutes |
+| Command                                             | Purpose                   |
+| --------------------------------------------------- | ------------------------- |
+| `sudo systemctl restart tradingbot`                 | Restart the bot           |
+| `sudo systemctl stop tradingbot`                    | Stop the bot              |
+| `sudo systemctl start tradingbot`                   | Start the bot             |
+| `sudo systemctl status tradingbot`                  | Show status & recent logs |
+| `sudo journalctl -u tradingbot -f`                  | Follow live logs          |
+| `sudo journalctl -u tradingbot --since "5 min ago"` | Show last 5 minutes       |
+
+Deploying Updates
+Every time you push changes to GitHub and want to update the bot on the server:
+bashcd ~/trade-bot
+git pull
+source venv/bin/activate
+pip install -r requirements.txt # only needed if requirements changed
+sudo systemctl restart tradingbot
+sudo journalctl -u tradingbot -f # watch for errors
