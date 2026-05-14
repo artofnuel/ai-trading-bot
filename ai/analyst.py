@@ -1,16 +1,15 @@
 ﻿"""
-ai/analyst.py — Claude AI integration for generating Forex trade plans.
+ai/analyst.py — Claude AI integration for constraint-aware Forex trade plans.
 
-Upgrade summary vs v1:
-  - Full ICT/SMC system prompt with HTF->LTF drill-down methodology
-  - Mathematically precise pip value table per instrument (no guessing)
-  - ATR-anchored SL/TP (not arbitrary pip counts)
-  - PDH/PDL as primary liquidity targets in every analysis
-  - Weighted confluence scoring rubric (10 weighted factors, not vague)
-  - Kill zone timing awareness baked into session field
-  - Execution type derived deterministically from live vs entry
-  - All dollar calculations shown step-by-step then confirmed in JSON
-  - Crypto removed entirely
+v3 changes:
+  - ICT AMD (Accumulation/Manipulation/Distribution) methodology
+  - Constraint-first logic: Claude calculates max SL pips from budget,
+    then finds a pair/setup that fits — never the other way around
+  - NO_TRADE response: clean rejection with reason when no setup qualifies
+  - Claude owns 100% of all maths — server does zero parallel calculation
+  - Market context (PDH/PDL, ATR) fed as named structural references
+  - Compact single-message output schema
+  - Crypto removed
 """
 
 import asyncio
@@ -23,458 +22,377 @@ from typing import Optional
 import anthropic
 
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS, CLAUDE_TIMEOUT
-from market.prices import fetch_market_context, fetch_all_forex_prices, _normalise_pair
+from market.prices import fetch_market_context, fetch_all_forex_prices, _normalise
 
 logger = logging.getLogger(__name__)
 
 
-# -- Custom exception ------------------------------------------------
-
 class AnalystError(Exception):
-    """Raised when the AI analyst cannot produce a valid trade plan."""
+    """Raised when the analyst cannot produce any response."""
 
 
-# -- Pip value table --------------------------------------------------
-# These are EXACT pip values per standard lot (100,000 units) in USD.
-# Pip values scale linearly with lot size.
-# Source: standard broker specifications.
+# ── Instrument specification table ────────────────────────────────────────────
+# Passed verbatim into the prompt so Claude has exact instrument specs.
+# pip_size  = smallest price increment that counts as 1 pip
+# pip_usd   = USD value of 1 pip at 1.00 standard lot
+# min_sl    = tightest structurally meaningful SL in pips (below this = noise)
+# notes     = any broker/instrument quirks Claude must know
 
-PIP_VALUE_TABLE = {
-    # pair_keyword : (pip_size, usd_per_pip_per_standard_lot, notes)
-    "XAUUSD": (0.01,  1.00,  "Gold: 1 pip = $0.01 move, $1/pip/std lot, $0.10/pip/0.1lot"),
-    "XAGUSD": (0.001, 50.0,  "Silver: pip = $0.001, ~$50/pip/std lot"),
-    "USDJPY": (0.01,  6.50,  "JPY pair: pip = 0.01, ~$6.50/pip/std lot (varies with rate)"),
-    "GBPJPY": (0.01,  6.50,  "JPY pair: pip = 0.01, ~$6.50/pip/std lot"),
-    "EURJPY": (0.01,  6.50,  "JPY pair"),
-    "AUDJPY": (0.01,  6.50,  "JPY pair"),
-    "CADJPY": (0.01,  6.50,  "JPY pair"),
-    "CHFJPY": (0.01,  6.50,  "JPY pair"),
-    "EURUSD": (0.0001, 10.0, "Standard USD pair: pip = 0.0001, $10/pip/std lot"),
-    "GBPUSD": (0.0001, 10.0, "Standard USD pair"),
-    "AUDUSD": (0.0001, 10.0, "Standard USD pair"),
-    "NZDUSD": (0.0001, 10.0, "Standard USD pair"),
-    "USDCAD": (0.0001, 10.0, "USD/CAD: ~$7.60/pip/std lot at 1.32 rate -- use $7.60"),
-    "USDCHF": (0.0001, 10.0, "USD/CHF: ~$11.30/pip/std lot at 0.89 rate -- use $11.00"),
-    "EURGBP": (0.0001, 12.5, "Cross pair: ~$12.50/pip/std lot"),
-    "GBPAUD": (0.0001, 10.0, "Cross pair"),
-    "EURAUD": (0.0001, 10.0, "Cross pair"),
-    "DEFAULT":(0.0001, 10.0, "Default: assume USD quote pair"),
+INSTRUMENT_SPECS = {
+    "EUR/USD": {"pip_size": 0.0001, "pip_usd_std": 10.00, "min_sl_pips": 5,  "notes": "Most liquid pair. 5-pip SL viable on M1 scalp only."},
+    "GBP/USD": {"pip_size": 0.0001, "pip_usd_std": 10.00, "min_sl_pips": 7,  "notes": "Volatile. Wider spreads during London open."},
+    "USD/JPY": {"pip_size": 0.01,   "pip_usd_std": 6.50,  "min_sl_pips": 8,  "notes": "pip_size=0.01. pip_usd varies with rate (~$6.50 at 154)."},
+    "GBP/JPY": {"pip_size": 0.01,   "pip_usd_std": 6.50,  "min_sl_pips": 12, "notes": "pip_size=0.01. Highly volatile cross — wider SL needed."},
+    "EUR/JPY": {"pip_size": 0.01,   "pip_usd_std": 6.50,  "min_sl_pips": 10, "notes": "pip_size=0.01."},
+    "AUD/USD": {"pip_size": 0.0001, "pip_usd_std": 10.00, "min_sl_pips": 6,  "notes": "Commodity-linked. Watch AUD/CNH correlation."},
+    "USD/CAD": {"pip_size": 0.0001, "pip_usd_std": 7.60,  "min_sl_pips": 6,  "notes": "pip_usd ~$7.60 at 1.32 rate."},
+    "USD/CHF": {"pip_size": 0.0001, "pip_usd_std": 11.00, "min_sl_pips": 6,  "notes": "pip_usd ~$11.00 at 0.89 rate."},
+    "EUR/GBP": {"pip_size": 0.0001, "pip_usd_std": 12.50, "min_sl_pips": 5,  "notes": "Range-bound cross. Good for tight scalps."},
+    "GBP/AUD": {"pip_size": 0.0001, "pip_usd_std": 10.00, "min_sl_pips": 12, "notes": "Very volatile cross."},
+    "XAU/USD": {"pip_size": 0.01,   "pip_usd_std": 100.00,"min_sl_pips": 200,"notes": "pip_size=0.01. pip_usd=$1.00/pip at 0.01 lot. min_sl=200 pips (~$2 at 0.01 lot). Needs large balance for structural SL."},
+    "XAG/USD": {"pip_size": 0.001,  "pip_usd_std": 50.00, "min_sl_pips": 100,"notes": "pip_size=0.001. Volatile metal."},
 }
 
-def get_pip_info(pair: str):
-    """Return (pip_size, usd_per_pip_std_lot, notes) for a given pair."""
-    pair_key = _normalise_pair(pair).replace("/", "").upper()
-    for key, info in PIP_VALUE_TABLE.items():
-        if key == "DEFAULT":
-            continue
-        if key in pair_key or pair_key in key:
-            return info
-    return PIP_VALUE_TABLE["DEFAULT"]
+def _spec_block() -> str:
+    """Format the instrument spec table for inclusion in the prompt."""
+    lines = ["INSTRUMENT SPECIFICATIONS (exact — use these values, not estimates):"]
+    lines.append(f"{'Pair':<10} {'pip_size':<12} {'pip_usd/std_lot':<18} {'min_sl_pips':<14} Notes")
+    lines.append("─" * 90)
+    for pair, s in INSTRUMENT_SPECS.items():
+        lines.append(
+            f"{pair:<10} {s['pip_size']:<12} ${s['pip_usd_std']:<17.2f} {s['min_sl_pips']:<14} {s['notes']}"
+        )
+    return "\n".join(lines)
 
 
-def calculate_pip_value(pair: str, lot_size: float) -> tuple[float, float]:
-    """
-    Returns (pip_value_usd, pip_size) for given pair and lot size.
-    pip_value_usd = usd_per_pip_std_lot * lot_size
-    """
-    pip_size, usd_per_std, _ = get_pip_info(pair)
-    pip_value = usd_per_std * lot_size
-    return round(pip_value, 4), pip_size
+# ── Session detector ──────────────────────────────────────────────────────────
 
-
-# -- Session / kill zone detector --------------------------------------
-
-def get_current_session_info() -> dict:
-    """
-    Determine current UTC time and map to Forex session and kill zone.
-    Kill zones are the highest-probability entry windows per ICT methodology.
-    """
-    now_utc = datetime.now(timezone.utc)
-    hour = now_utc.hour
-    time_str = now_utc.strftime("%H:%M UTC")
-    weekday = now_utc.strftime("%A")
-
-    # Kill zone windows (UTC)
-    if 2 <= hour < 5:
-        session = "London Open"
-        kill_zone = True
-        kz_note = "London Kill Zone (02:00-05:00 UTC) -- highest probability window"
-    elif 7 <= hour < 10:
-        session = "New York Open"
-        kill_zone = True
-        kz_note = "New York Kill Zone (07:00-10:00 UTC) -- second highest probability window"
-    elif 10 <= hour < 12:
-        session = "London-NY Overlap"
-        kill_zone = False
-        kz_note = "Overlap -- high liquidity but Judas swing risk; wait for clear direction"
-    elif 0 <= hour < 2:
-        session = "Asian / London Pre-market"
-        kill_zone = False
-        kz_note = "Asian session -- range-building, avoid new entries; note Asian range H/L"
-    elif 5 <= hour < 7:
-        session = "Early London"
-        kill_zone = False
-        kz_note = "Post-London open consolidation -- less optimal for entries"
-    elif 12 <= hour < 17:
-        session = "New York"
-        kill_zone = False
-        kz_note = "NY mid-session -- valid for continuation setups; avoid 12:00-13:00 UTC lunch"
-    else:
-        session = "Off-Peak"
-        kill_zone = False
-        kz_note = "Low liquidity window -- avoid new entries; wait for next session"
-
+def _session_info() -> dict:
+    now = datetime.now(timezone.utc)
+    h = now.hour
+    if   2 <= h <  5: session, kz = "London Open",        True
+    elif 7 <= h < 10: session, kz = "New York Open",      True
+    elif 0 <= h <  2: session, kz = "Asian",              False
+    elif 5 <= h <  7: session, kz = "London (mid)",       False
+    elif 10 <= h < 12:session, kz = "London-NY Overlap",  False
+    elif 12 <= h < 17:session, kz = "New York (mid)",     False
+    else:              session, kz = "Off-Peak",           False
     return {
-        "session": session,
-        "kill_zone_active": kill_zone,
-        "kill_zone_note": kz_note,
-        "current_utc": time_str,
-        "weekday": weekday,
+        "session":  session,
+        "kz":       kz,
+        "utc_time": now.strftime("%H:%M UTC"),
+        "weekday":  now.strftime("%A"),
     }
 
 
-# -- System prompt -----------------------------------------------------
+# ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an elite Forex trade analyst operating exclusively within the ICT (Inner Circle Trader) \
-and Smart Money Concepts (SMC) framework. Your analysis is used by real traders placing real money. \
-Every number you output will be verified. There is zero tolerance for approximations, made-up levels, \
-or mathematically incorrect calculations.
+You are an elite Forex trade analyst. Your methodology is ICT's AMD model \
+(Accumulation / Manipulation / Distribution). You have one job: find the \
+highest-probability trade that fits within the trader's exact account constraints. \
+If no valid setup exists, say so clearly.
 
-============================================
-CORE RULES -- NON-NEGOTIABLE
-============================================
+══════════════════════════════════════════════════════
+STEP 1 — CALCULATE CONSTRAINTS FIRST (always do this)
+══════════════════════════════════════════════════════
 
-1. LIVE PRICE IS KING
-   The live_price provided is the REAL current market price fetched milliseconds ago.
-   Every single level (entry, SL, all TPs) must be coherently anchored to that price.
-   Never suggest levels that are illogical relative to the live price.
+Before analysing any chart, calculate:
 
-2. MATHEMATICALLY EXACT CALCULATIONS -- NO EXCEPTIONS
-   You are given: lot_size, pip_value_per_lot, pip_size, balance, risk_percent.
-   Use ONLY these formulas -- never estimate:
+  risk_dollars  = balance × (risk_pct / 100)
+  pip_value_usd = pip_usd_per_std_lot × lot_size
+  max_sl_pips   = risk_dollars / pip_value_usd    ← this is your hard ceiling
 
-   risk_amount        = balance * (risk_percent / 100)
-   stop_loss_pips     = |entry - stop_loss| / pip_size        [round to nearest whole pip]
-   pip_value_usd      = pip_value_per_lot                     [already computed for you]
-   risk_check         = stop_loss_pips * pip_value_usd        [must ~= risk_amount; flag if >10% off]
-   tp_pips[n]         = |tp_price[n] - entry| / pip_size
-   profit_at_tp[n]    = tp_pips[n] * pip_value_usd * partial_close_fraction
-   rr_ratio[n]        = tp_pips[n] / stop_loss_pips           [format as "1:X.X"]
-   total_profit       = sum of all profit_at_tp[n]
+Example: balance=$30, risk=2%, lot=0.01, pair=EUR/USD
+  risk_dollars  = 30 × 0.02 = $0.60
+  pip_value_usd = 10.00 × 0.01 = $0.10/pip
+  max_sl_pips   = 0.60 / 0.10 = 6 pips maximum
 
-   XAU/USD special: pip_size = 0.01, pip_value_per_0.01lot = $0.10
-   JPY pairs special: pip_size = 0.01
+This ceiling is absolute. You CANNOT place a SL wider than max_sl_pips.
 
-3. EXECUTION TYPE -- DERIVE MATHEMATICALLY
-   BUY  setups: live_price > entry -> Buy Limit  | live_price < entry -> Buy Stop  | equal -> Buy Market
-   SELL setups: live_price < entry -> Sell Limit | live_price > entry -> Sell Stop | equal -> Sell Market
+══════════════════════════════════════════════════════
+STEP 2 — PAIR SELECTION AGAINST CONSTRAINTS
+══════════════════════════════════════════════════════
 
-4. DIRECTION -- DERIVE FROM STRUCTURE, NOT GUESSING
-   Use PDH (previous day high) and PDL (previous day low) as primary liquidity references.
-   In a bullish HTF market: price sweeping PDL then reversing = high-probability BUY setup.
-   In a bearish HTF market: price sweeping PDH then reversing = high-probability SELL setup.
-   If no clear directional bias exists, state this in rationale and reduce confluence score.
+If the user specified a pair:
+  - Check: does a structurally valid ICT SL exist within max_sl_pips?
+  - A structurally valid SL sits BELOW a confirmed Order Block, FVG,
+    or swing low (BUY) / ABOVE a swing high or OB (SELL).
+  - If the pair's min_sl_pips > max_sl_pips: you CANNOT trade that pair
+    at this account size with this lot size. Do not force it.
+  - Instead: suggest the best alternative pair where max_sl_pips ≥ min_sl_pips,
+    use that pair, and explain the switch in the rationale.
 
-5. ICT/SMC METHODOLOGY -- APPLY STRICTLY
-   Valid entry reasons (cite which one applies):
-     a) Price is at or has swept into a Daily/4H Order Block and shown rejection
-     b) A Fair Value Gap (FVG) on 1H/15M has been identified and price is returning to fill it
-     c) Liquidity (PDH, PDL, equal highs, equal lows) has been swept and structure shifted (CHoCH/BOS)
-     d) Premium/Discount zones: buys in discount (<50% of swing range), sells in premium (>50%)
-   Never place entry in the middle of a range with no confluence.
+If the user said "AI picks":
+  - From the live prices provided, select the pair where:
+    a) max_sl_pips ≥ pair's min_sl_pips (constraint fits)
+    b) AMD structure is clearest (best setup)
+  - Ignore any pair where the constraint cannot be satisfied.
 
-6. ATR-ANCHORED STOP LOSS
-   ATR is provided. SL must respect ATR -- it must be wide enough that normal volatility
-   does not stop the trade prematurely.
-   Scalp SL minimum: 0.5* ATR_1H. Maximum: 1.5* ATR_1H.
-   Swing SL minimum: 0.75* ATR_4H. Maximum: 2.0* ATR_4H.
-   If the mathematically required SL pip count violates these ATR bounds, note it in caution.
+══════════════════════════════════════════════════════
+STEP 3 — AMD ENTRY FRAMEWORK (apply in order)
+══════════════════════════════════════════════════════
 
-7. TRADE STYLE RULES
-   SCALP:
-     - Max SL: 15 pips for major Forex pairs | Gold max SL: 200 pips (Gold pip = 0.01)
-     - Entry must be within 10 pips of live price (Forex) / 150 pips (Gold)
-     - 2 TPs only: TP1 at 1:1.5 minimum, TP2 at 1:2.5 minimum
-     - partial_close: TP1=50%, TP2=50%
-     - Best during kill zones; note if outside kill zone
-   SWING:
-     - 3 TPs: TP1 conservative, TP2 moderate, TP3 extended
-     - TP1 partial_close=40%, TP2=40%, TP3=20%
-     - Confluence score minimum 7 to proceed
-     - SL beyond a confirmed OB or structural level
+A valid trade requires ALL THREE phases to be identifiable:
 
-8. CONFLUENCE SCORING -- WEIGHTED (out of 10, show your working)
-   Score each factor and sum them. State score/10 in the JSON:
-     HTF (4H/Daily) structure aligned with direction : +2.0
-     Kill zone active at time of analysis             : +1.5
-     Order Block / FVG at entry zone                  : +2.0
-     Liquidity swept before entry (PDH/PDL or EQH/L) : +1.5
-     Price in Premium (sell) or Discount (buy) zone  : +1.0
-     BOS or CHoCH confirmed on LTF (15M/1H)          : +1.0
-     ATR confirms SL has room to breathe              : +0.5
-     R:R >= 1:2 at TP1                                : +0.5
-   Maximum: 10. Minimum to take trade: 6 (scalp), 7 (swing).
-   If score < minimum, state "SETUP BELOW THRESHOLD" in caution and reduce TP targets.
+A) ACCUMULATION — Smart money builds position quietly.
+   Evidence: tight consolidation, Asian range, equilibrium zone.
+   The consolidation range defines the dealing range.
 
-============================================
-OUTPUT FORMAT -- STRICT JSON ONLY
-============================================
-No markdown. No explanation outside the JSON. Return exactly this structure:
+B) MANIPULATION (Judas Swing) — Price sweeps liquidity to the WRONG side
+   before the real move. This is the most important signal.
+   Evidence: wick below equal lows (for BUY) or above equal highs (for SELL),
+   PDL/PDH sweep, stop hunt candle with fast rejection.
+   WITHOUT a confirmed Judas swing, the setup scores maximum 5/10.
 
+C) DISTRIBUTION — The actual directional move begins.
+   Evidence: CHoCH (Change of Character) or BOS (Break of Structure) on LTF,
+   price leaving the manipulation wick behind, imbalance (FVG) created.
+
+Entry is placed at the origin of the distribution leg — the OB or FVG
+left behind by the manipulation candle — not at the current price.
+
+══════════════════════════════════════════════════════
+STEP 4 — TRADE STYLE RULES
+══════════════════════════════════════════════════════
+
+SCALP:
+  - Best window: London Kill Zone (02:00-05:00 UTC) or NY Kill Zone (07:00-10:00 UTC)
+  - SL must be within max_sl_pips AND ≥ min_sl_pips for the instrument
+  - Entry within 10 pips of live price (Forex majors)
+  - 2 TPs: TP1 minimum 1:1.5 RR, TP2 minimum 1:2.5 RR
+  - If current session is Off-Peak or Asian with no momentum: NO_TRADE
+  - partial close: TP1=50%, TP2=50%
+
+SWING:
+  - 3 TPs targeting PDH/PDL and beyond
+  - SL behind structural level (OB base, confirmed swing high/low)
+  - Minimum confluence score: 7/10
+  - partial close: TP1=40%, TP2=40%, TP3=20%
+  - If confluence < 7: NO_TRADE
+
+══════════════════════════════════════════════════════
+STEP 5 — CONFLUENCE SCORING (score BEFORE deciding to trade)
+══════════════════════════════════════════════════════
+
+Score each. Sum them. Report total/10:
+  Judas swing confirmed (manipulation sweep visible)  : 3.0  ← most important
+  CHoCH or BOS on LTF after sweep                    : 2.0
+  Entry at OB or FVG (not mid-range)                 : 1.5
+  Kill zone active                                   : 1.0
+  Price in discount (BUY) / premium (SELL) of range  : 1.0
+  PDH or PDL as TP target                            : 0.5
+  ATR confirms SL has breathing room                 : 0.5
+  Maximum: 9.5 (round to nearest 0.5 for display)
+
+Minimum to trade: 6.0 (scalp), 7.0 (swing).
+If below minimum: return NO_TRADE.
+
+══════════════════════════════════════════════════════
+STEP 6 — MATHS (own every calculation)
+══════════════════════════════════════════════════════
+
+You already computed pip_value_usd and max_sl_pips in Step 1.
+Now compute:
+
+  stop_loss_pips  = |entry_price - stop_loss_price| / pip_size
+  risk_amount     = stop_loss_pips × pip_value_usd         ← must ≤ risk_dollars
+  tp_pips[n]      = |tp_price[n] - entry_price| / pip_size
+  profit[n]       = tp_pips[n] × pip_value_usd × partial_close_fraction
+  total_profit    = sum of all profit[n]
+  rr[n]           = tp_pips[n] / stop_loss_pips             (format "1:X.X")
+
+  execution type:
+    BUY:  live > entry → Buy Limit  | live < entry → Buy Stop  | equal → Market
+    SELL: live < entry → Sell Limit | live > entry → Sell Stop | equal → Market
+
+══════════════════════════════════════════════════════
+OUTPUT FORMAT — STRICT JSON, TWO POSSIBLE SCHEMAS
+══════════════════════════════════════════════════════
+
+IF a valid trade exists → return TRADE schema:
 {
-  "pair": "XAU/USD",
+  "type": "TRADE",
+  "pair": "EUR/USD",
   "direction": "BUY",
-  "trade_style": "scalp",
-  "current_market_price": "2345.50",
-  "execution": "Buy Limit",
-  "entry": "2343.00",
-  "stop_loss": "2340.50",
-  "stop_loss_pips": 250,
-  "lot_size": "0.10",
-  "pip_value": "$1.00 per pip",
-  "risk_amount": "$25.00",
-  "risk_percent": 2.5,
-  "take_profits": [
-    {"label": "TP1", "price": "2349.75", "pips": 675, "rr": "1:2.7", "partial_close": "50%", "profit": "$33.75"},
-    {"label": "TP2", "price": "2355.50", "pips": 1250, "rr": "1:5.0", "partial_close": "50%", "profit": "$62.50"}
-  ],
-  "total_potential_profit": "$96.25",
-  "trailing_stop": {
-    "recommended": true,
-    "activate_at": "TP1",
-    "trail_distance_pips": 150,
-    "rationale": "Trail 150 pips behind price after TP1 hit to lock profit while targeting TP2."
-  },
-  "confluence_breakdown": {
-    "htf_structure": 2.0,
-    "kill_zone": 0.0,
-    "ob_fvg": 2.0,
-    "liquidity_swept": 1.5,
-    "premium_discount": 1.0,
-    "bos_choch": 0.5,
-    "atr_sl_room": 0.5,
-    "rr_quality": 0.5
-  },
-  "confluence_score": 8,
+  "style": "scalp",
   "session": "London Open",
-  "kill_zone_active": false,
-  "htf_bias": "Bullish -- Daily structure showing HH/HL sequence, price pulling back into 4H OB",
-  "key_levels": {
-    "pdh": "2351.20",
-    "pdl": "2338.40",
-    "entry_rationale": "4H Order Block at 2343.00, FVG overlap, discount zone (below 50% of daily range)"
-  },
-  "rationale": "3 sentences max. HTF context + LTF trigger + why entry is valid per ICT.",
-  "caution": "Trade invalidated if price closes a 1H candle below 2339.00 (below OB + PDL).",
-  "math_check": "SL=250pips * $1.00/pip=$25.00 risk [OK] | TP1=675pips*$1.00*0.5=$33.75 [OK] | TP2=1250pips*$1.00*0.5=$62.50 [OK]"
+  "kill_zone": true,
+  "confluence": 7.5,
+  "live_price": "1.08430",
+  "execution": "Buy Limit",
+  "entry": "1.08380",
+  "sl": "1.08320",
+  "sl_pips": 6,
+  "lot": "0.01",
+  "pip_value": "$0.10",
+  "risk_usd": "$0.60",
+  "tps": [
+    {"label":"TP1","price":"1.08470","pips":9,"rr":"1:1.5","close":"50%","profit":"$0.45"},
+    {"label":"TP2","price":"1.08530","pips":15,"rr":"1:2.5","close":"50%","profit":"$0.75"}
+  ],
+  "total_profit": "$1.20",
+  "trail": {"active": true, "from": "TP1", "pips": 5},
+  "pdh": "1.08610",
+  "pdl": "1.08190",
+  "amd": "Asian range 1.08350-1.08450. Judas sweep below 1.08370 equal lows at 02:14 UTC, fast rejection. CHoCH on M5 at 1.08400 confirms distribution north toward PDH.",
+  "rationale": "2 sentences max. WHY this specific entry, anchored to live price and AMD phases.",
+  "caution": "Invalidated on 1H close below 1.08320 (below OB and SL)."
 }
+
+IF no valid trade exists → return NO_TRADE schema:
+{
+  "type": "NO_TRADE",
+  "reason": "One clear sentence: why no trade. E.g. max_sl_pips=6 but XAU/USD requires min 200 pips; switched to EUR/USD but no Judas swing confirmed yet.",
+  "suggestion": "One actionable sentence: what to watch for or when to check again."
+}
+
+No markdown. No text outside the JSON object.
 """
 
 
-# -- Prompt builder ----------------------------------------------------
+# ── Prompt builder ────────────────────────────────────────────────────────────
 
-def _build_user_prompt(
+def _build_prompt(
     balance: float,
     pair: Optional[str],
     risk: str,
-    trade_style: str,
+    style: str,
+    lot: str,
     notes: str,
-    market_ctx: dict,
-    pair_prices: Optional[dict],
-    lot_size: str,
-    session_info: dict,
+    ctx: dict,
+    all_prices: dict,
+    sess: dict,
 ) -> str:
-    risk_map = {"conservative": 1, "moderate": 2, "aggressive": 3}
-    risk_pct = risk_map.get(risk.lower(), 2)
-    risk_dollars = balance * risk_pct / 100
-    lot = float(lot_size)
+    risk_map  = {"conservative": 1, "moderate": 2, "aggressive": 3}
+    risk_pct  = risk_map.get(risk.lower(), 2)
+    risk_usd  = balance * risk_pct / 100
 
-    # Compute pip value server-side so Claude has exact number
-    if pair:
-        pip_val_usd, pip_size = calculate_pip_value(pair, lot)
-        _, _, pip_notes = get_pip_info(pair)
-        pip_block = (
-            f"Pip Size    : {pip_size} (exact for this instrument)\n"
-            f"Pip Val/lot : ${pip_val_usd:.4f} per pip at {lot_size} lots\n"
-            f"Pip Notes   : {pip_notes}"
-        )
-    else:
-        pip_val_usd = lot * 10   # default estimate
-        pip_size = 0.0001
-        pip_block = f"Pip Val/lot : ~${pip_val_usd:.4f}/pip (default; adjust per chosen pair)"
+    # ── Account constraints block ────
+    constraints = (
+        f"ACCOUNT CONSTRAINTS (calculate from these — do not ignore)\n"
+        f"  Balance      : ${balance:,.2f}\n"
+        f"  Risk         : {risk.capitalize()} — {risk_pct}% = ${risk_usd:.2f}\n"
+        f"  Lot size     : {lot} (exact — never change)\n"
+        f"  Trade style  : {style.upper()}\n"
+        f"  Pair request : {pair.upper() if pair else 'AI selects best opportunity'}\n"
+    )
 
-    # Price / market context block
-    if pair and market_ctx.get("live_price"):
-        lp = market_ctx["live_price"]
-        pdh = market_ctx.get("pdh", "N/A")
-        pdl = market_ctx.get("pdl", "N/A")
-        pd_open  = market_ctx.get("pd_open", "N/A")
-        pd_close = market_ctx.get("pd_close", "N/A")
-        atr_1h   = market_ctx.get("atr_1h", "N/A")
-        atr_4h   = market_ctx.get("atr_4h", "N/A")
+    # ── Instrument spec table ────
+    spec = _spec_block()
 
-        # Determine if price is in premium or discount of previous day range
+    # ── Market data block ────
+    if pair and ctx.get("live_price"):
+        # Try to calculate premium/discount zone
         try:
-            pdh_f = float(pdh)
-            pdl_f = float(pdl)
-            lp_f  = float(lp)
-            pd_range = pdh_f - pdl_f
-            midpoint = pdl_f + pd_range / 2
-            pct_position = ((lp_f - pdl_f) / pd_range * 100) if pd_range > 0 else 50
-            zone = "PREMIUM (above midpoint -- favour SELLS)" if lp_f > midpoint else "DISCOUNT (below midpoint -- favour BUYS)"
-            zone_line = f"Price Zone  : {zone} ({pct_position:.1f}% of prev day range)"
-        except (ValueError, ZeroDivisionError):
-            zone_line = "Price Zone  : Unable to calculate"
+            pdh_f = float(ctx["pdh"])
+            pdl_f = float(ctx["pdl"])
+            lp_f  = float(ctx["live_price"])
+            mid   = pdl_f + (pdh_f - pdl_f) / 2
+            zone  = "DISCOUNT (favour BUY)" if lp_f <= mid else "PREMIUM (favour SELL)"
+            pct   = (lp_f - pdl_f) / (pdh_f - pdl_f) * 100
+            zone_line = f"  Zone         : {zone} ({pct:.1f}% of prev day range)"
+        except Exception:
+            zone_line = "  Zone         : N/A"
 
         market_block = (
-            f"=== LIVE MARKET DATA (fetched now -- use these exact values) ===\n"
-            f"Live Price  : {lp}  <- anchor ALL levels to this\n"
-            f"PDH         : {pdh}  <- previous day high (liquidity above)\n"
-            f"PDL         : {pdl}  <- previous day low (liquidity below)\n"
-            f"Prev D Open : {pd_open}\n"
-            f"Prev D Close: {pd_close}\n"
-            f"ATR (14,1H) : {atr_1h}  <- use for scalp SL validation\n"
-            f"ATR (14,4H) : {atr_4h}  <- use for swing SL validation\n"
+            f"LIVE MARKET DATA (fetched now — anchor all levels to live_price)\n"
+            f"  Live price   : {ctx['live_price']}\n"
+            f"  PDH          : {ctx.get('pdh', 'N/A')}  ← yesterday high (liquidity above)\n"
+            f"  PDL          : {ctx.get('pdl', 'N/A')}  ← yesterday low  (liquidity below)\n"
+            f"  Prev D open  : {ctx.get('pd_open', 'N/A')}\n"
+            f"  Prev D close : {ctx.get('pd_close', 'N/A')}\n"
+            f"  ATR (14,1H)  : {ctx.get('atr_1h', 'N/A')}  ← volatility baseline\n"
             f"{zone_line}"
         )
     elif pair:
         market_block = (
-            "=== LIVE MARKET DATA ===\n"
-            "Live Price  : UNAVAILABLE -- use your best estimate from market knowledge.\n"
-            "IMPORTANT: State your estimated price clearly in current_market_price.\n"
-            "Flag in caution that price is estimated, not live."
+            "LIVE MARKET DATA\n"
+            "  Live price   : UNAVAILABLE — estimate from market knowledge.\n"
+            "  Flag in rationale that price is estimated."
         )
     else:
-        if pair_prices:
-            prices_str = "\n".join(f"  {p} = {v}" for p, v in pair_prices.items())
+        if all_prices:
+            price_lines = "\n".join(f"  {p} : {v}" for p, v in all_prices.items())
             market_block = (
-                f"=== LIVE PRICES -- SELECT BEST OPPORTUNITY ===\n{prices_str}\n"
-                f"Pick the pair with the strongest ICT/SMC confluence. "
-                f"Use its live price as anchor."
+                f"LIVE PRICES (AI pair selection — pick best AMD setup that fits constraints)\n"
+                f"{price_lines}"
             )
         else:
-            market_block = "=== LIVE PRICES ===\nUNAVAILABLE -- use market knowledge."
+            market_block = "LIVE PRICES: UNAVAILABLE — use market knowledge."
 
-    # Session / kill zone
-    kz_status = "[ACTIVE]" if session_info["kill_zone_active"] else "[NOT ACTIVE]"
+    # ── Session block ────
+    kz = "✅ ACTIVE" if sess["kz"] else "❌ NOT ACTIVE"
     session_block = (
-        f"=== SESSION & TIMING ===\n"
-        f"Current UTC : {session_info['current_utc']} ({session_info['weekday']})\n"
-        f"Session     : {session_info['session']}\n"
-        f"Kill Zone   : {kz_status}\n"
-        f"Note        : {session_info['kill_zone_note']}"
+        f"SESSION\n"
+        f"  Time    : {sess['utc_time']} ({sess['weekday']})\n"
+        f"  Session : {sess['session']}\n"
+        f"  Kill Zone: {kz}"
     )
 
-    # Style-specific rules
-    if trade_style == "scalp":
-        style_block = (
-            "SCALP MODE:\n"
-            "  - SL <= 15 pips (Forex majors) | Gold SL <= 200 pips (0.01 pip size)\n"
-            "  - Entry must be within 10 pips (Forex) / 150 pips (Gold) of live price\n"
-            "  - 2 TPs only: TP1 >= 1:1.5 RR, TP2 >= 1:2.5 RR\n"
-            "  - partial_close: TP1=50%, TP2=50%\n"
-            "  - If kill zone NOT active, reduce confluence score by 1.5 and note in caution"
-        )
-    else:
-        style_block = (
-            "SWING MODE:\n"
-            "  - 3 TPs required: TP1 conservative, TP2 moderate, TP3 extended\n"
-            "  - partial_close: TP1=40%, TP2=40%, TP3=20%\n"
-            "  - Confluence >= 7 required; if below 7, state in caution\n"
-            "  - SL must be beyond structural level (OB base, swing high/low)"
-        )
+    notes_line = f"TRADER NOTES: {notes}" if notes else "TRADER NOTES: None"
 
-    return (
-        f"=== TRADE REQUEST ===\n"
-        f"Balance     : ${balance:,.2f}\n"
-        f"Pair        : {pair.upper() if pair else 'AI selects best opportunity'}\n"
-        f"Risk        : {risk.capitalize()} ({risk_pct}% = ${risk_dollars:,.2f})\n"
-        f"Lot Size    : {lot_size} lots (EXACT -- do not change under any circumstance)\n"
-        f"{pip_block}\n\n"
-        f"{market_block}\n\n"
-        f"{session_block}\n\n"
-        f"Trade Style : {trade_style.upper()}\n"
-        f"{style_block}\n\n"
-        f"Trader Notes: {notes or 'None'}\n\n"
-        f"=== MATH VERIFICATION REQUIRED ===\n"
-        f"Confirm in math_check field:\n"
-        f"  risk_amount = SL_pips * pip_value_usd -> must equal ${risk_dollars:,.2f} +/- 15%\n"
-        f"  If risk_check deviates >15%, adjust SL pips to align, or explain why in caution.\n\n"
-        f"Return ONLY the JSON object. No markdown. No explanation outside JSON."
-    )
+    return "\n\n".join([
+        constraints,
+        spec,
+        market_block,
+        session_block,
+        notes_line,
+        "Return ONLY the JSON object. No markdown. No text outside JSON.",
+    ])
 
 
-# -- Main function -----------------------------------------------------
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 async def get_trade_plan(
     balance: float,
     pair: Optional[str] = None,
     risk: str = "moderate",
-    trade_style: str = "swing",
+    style: str = "swing",
     notes: str = "",
-    lot_size: str = "0.01",
+    lot: str = "0.01",
 ) -> dict:
     """
-    Fetch full market context then generate a trade plan with Claude.
-    Returns validated plan dict.
+    Fetch market context then call Claude.
+    Returns a dict with key 'type': 'TRADE' or 'NO_TRADE'.
     """
-
-    # Step 1 -- Get session info (free, no API call)
-    session_info = get_current_session_info()
-    logger.info(
-        "Session: %s | Kill zone: %s",
-        session_info["session"],
-        session_info["kill_zone_active"],
-    )
-
-    # Step 2 -- Fetch enriched market data
-    market_ctx: dict = {}
-    pair_prices: dict = {}
+    sess = _session_info()
+    ctx: dict = {}
+    all_prices: dict = {}
 
     if pair:
-        logger.info("Fetching market context: %s [%s]", pair, trade_style)
-        market_ctx = await fetch_market_context(pair, trade_style)
-        if not market_ctx.get("live_price"):
-            logger.warning("Live price fetch failed for %s", pair)
+        ctx = await fetch_market_context(pair)
     else:
-        logger.info("Fetching all Forex prices for AI pair selection")
-        pair_prices = await fetch_all_forex_prices()
+        all_prices = await fetch_all_forex_prices()
 
-    # Step 3 -- Build prompt
-    user_prompt = _build_user_prompt(
+    prompt = _build_prompt(
         balance=balance,
         pair=pair,
         risk=risk,
-        trade_style=trade_style,
+        style=style,
+        lot=lot,
         notes=notes,
-        market_ctx=market_ctx,
-        pair_prices=pair_prices,
-        lot_size=lot_size,
-        session_info=session_info,
+        ctx=ctx,
+        all_prices=all_prices,
+        sess=sess,
     )
 
     logger.info(
-        "Claude call | model=%s pair=%s style=%s lot=%s live=%s",
-        CLAUDE_MODEL,
-        pair or "AI",
-        trade_style,
-        lot_size,
-        market_ctx.get("live_price") or "N/A",
+        "Claude call | pair=%s style=%s lot=%s balance=$%.2f live=%s",
+        pair or "AI", style, lot, balance, ctx.get("live_price", "N/A"),
     )
 
-    # Step 4 -- Call Claude
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
         loop = asyncio.get_event_loop()
-        message = await loop.run_in_executor(
+        msg = await loop.run_in_executor(
             None,
             lambda: client.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=CLAUDE_MAX_TOKENS,
                 timeout=CLAUDE_TIMEOUT,
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_prompt}],
+                messages=[{"role": "user", "content": prompt}],
             ),
         )
     except anthropic.APITimeoutError:
@@ -482,12 +400,11 @@ async def get_trade_plan(
     except anthropic.APIConnectionError as e:
         raise AnalystError(f"Connection error: {e}")
     except anthropic.RateLimitError:
-        raise AnalystError("Rate limit hit. Wait a moment and try again.")
+        raise AnalystError("Rate limit hit. Wait a moment.")
     except anthropic.APIStatusError as e:
         raise AnalystError(f"Claude API error {e.status_code}: {e.message}")
 
-    # Step 5 -- Parse
-    raw: str = message.content[0].text.strip()
+    raw = msg.content[0].text.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
@@ -495,91 +412,25 @@ async def get_trade_plan(
         plan: dict = json.loads(raw)
     except json.JSONDecodeError as e:
         logger.error("JSON parse failed: %s", raw[:400])
-        raise AnalystError(f"Unexpected format from Claude. Try again. ({e})")
+        raise AnalystError(f"Unexpected format from Claude. ({e})")
 
-    # Step 6 -- Validate required fields
-    required = {
-        "pair", "direction", "trade_style", "current_market_price",
-        "execution", "entry", "stop_loss", "stop_loss_pips",
-        "take_profits", "lot_size", "pip_value", "risk_amount",
-        "risk_percent", "total_potential_profit", "confluence_score",
-        "session", "rationale", "caution",
-    }
-    missing = required - plan.keys()
-    if missing:
-        raise AnalystError(f"Claude response missing fields: {', '.join(sorted(missing))}")
+    if "type" not in plan:
+        raise AnalystError("Claude response missing 'type' field.")
 
-    # Step 7 -- Server-side math validation (belt-and-braces)
-    _validate_math(plan, balance, lot_size, pair or plan.get("pair", ""))
+    if plan["type"] == "TRADE":
+        required = {
+            "pair", "direction", "style", "live_price", "execution",
+            "entry", "sl", "sl_pips", "lot", "pip_value", "risk_usd",
+            "tps", "total_profit", "rationale", "caution",
+        }
+        missing = required - plan.keys()
+        if missing:
+            raise AnalystError(f"TRADE response missing: {', '.join(sorted(missing))}")
 
     logger.info(
-        "Plan ready | %s %s %s | entry=%s live=%s confluence=%s/10",
-        plan["trade_style"].upper(),
-        plan["direction"],
-        plan["pair"],
-        plan["entry"],
-        plan.get("current_market_price"),
-        plan.get("confluence_score"),
+        "Response | type=%s pair=%s confluence=%s",
+        plan.get("type"),
+        plan.get("pair", "N/A"),
+        plan.get("confluence", "N/A"),
     )
-
-    # Attach session context for formatter
-    plan["_session_info"] = session_info
-    plan["_market_ctx"] = {k: v for k, v in market_ctx.items() if k != "_"}
-
     return plan
-
-
-# -- Server-side math validation ---------------------------------------
-
-def _validate_math(plan: dict, balance: float, lot_size: str, pair: str) -> None:
-    """
-    Cross-check Claude's math against our own calculations.
-    Logs warnings on discrepancies -- does not block the plan but flags issues.
-    """
-    try:
-        lot = float(lot_size)
-        pip_val, pip_size = calculate_pip_value(pair, lot)
-        sl_pips = int(plan.get("stop_loss_pips", 0))
-
-        # Risk check
-        expected_risk = sl_pips * pip_val
-        stated_risk_str = str(plan.get("risk_amount", "0")).replace("$", "").replace(",", "")
-        try:
-            stated_risk = float(stated_risk_str)
-        except ValueError:
-            stated_risk = 0
-
-        if stated_risk > 0 and expected_risk > 0:
-            deviation = abs(expected_risk - stated_risk) / stated_risk
-            if deviation > 0.20:
-                logger.warning(
-                    "Math check: risk mismatch. Expected $%.2f, Claude stated $%.2f (%.0f%% off)",
-                    expected_risk, stated_risk, deviation * 100,
-                )
-
-        # TP profit check (first TP only)
-        tps = plan.get("take_profits", [])
-        if tps:
-            tp1 = tps[0]
-            tp1_pips = int(tp1.get("pips", 0))
-            partial = tp1.get("partial_close", "50%").replace("%", "")
-            try:
-                partial_frac = float(partial) / 100
-            except ValueError:
-                partial_frac = 0.5
-            expected_tp1_profit = tp1_pips * pip_val * partial_frac
-            stated_profit_str = str(tp1.get("profit", "0")).replace("$", "").replace(",", "")
-            try:
-                stated_profit = float(stated_profit_str)
-            except ValueError:
-                stated_profit = 0
-            if stated_profit > 0 and expected_tp1_profit > 0:
-                deviation = abs(expected_tp1_profit - stated_profit) / stated_profit
-                if deviation > 0.20:
-                    logger.warning(
-                        "Math check: TP1 profit mismatch. Expected $%.2f, Claude stated $%.2f",
-                        expected_tp1_profit, stated_profit,
-                    )
-
-    except Exception as e:
-        logger.warning("Math validation skipped: %s", e)
