@@ -5,11 +5,18 @@ TRADE    → clean signal card, one message, under Telegram's 4096 char limit
 NO_TRADE → brief explanation card
 """
 
+import re
+
 from datetime import datetime, timezone
 
 
 def _dir_emoji(d: str) -> str:
     return "🟢" if d.upper() == "BUY" else "🔴"
+
+
+def _e(text: str) -> str:
+    """Escape Markdown special chars in dynamic/LLM-sourced text."""
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
 
 
 def format_trade_plan(plan: dict, balance: float) -> str:
@@ -77,16 +84,16 @@ def _format_trade(plan: dict, balance: float) -> str:
     # AMD context
     amd = plan.get("amd")
     if amd:
-        lines.append(f"🔬 *AMD*: {amd}")
+        lines.append(f"🔬 *AMD*: {_e(amd)}")
         lines.append("━━━━━━━━━━━━━━━━━━━━")
 
     # Rationale
-    lines.append(f"📖 {plan.get('rationale','N/A')}")
+    lines.append(f"📖 {_e(plan.get('rationale','N/A'))}")
 
     # Caution
     caution = plan.get("caution")
     if caution:
-        lines.append(f"⚠️ {caution}")
+        lines.append(f"⚠️ {_e(caution)}")
 
     # Timestamp
     lines.append(
@@ -101,11 +108,11 @@ def _format_no_trade(plan: dict) -> str:
     lines = [
         "🚫 *NO TRADE — Conditions Not Met*",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"📋 {plan.get('reason', 'No valid setup found at this time.')}",
+        f"📋 {_e(plan.get('reason', 'No valid setup found at this time.'))}",
     ]
     suggestion = plan.get("suggestion")
     if suggestion:
-        lines.append(f"💡 {suggestion}")
+        lines.append(f"💡 {_e(suggestion)}")
     lines.append(
         f"\n⏱ {datetime.now(timezone.utc).strftime('%H:%M UTC')}  |  Use /trade to try again."
     )
