@@ -1,11 +1,13 @@
 """
-bot/formatter.py — Compact single-message formatter for v3 plan schema.
+bot/formatter.py — Clean, readable Telegram signal card for v3.
 
-TRADE    → clean signal card, one message, under Telegram's 4096 char limit
-NO_TRADE → brief explanation card
+Design principles:
+  - Prices in monospace (backticks) so they stand out
+  - Bold section labels
+  - Consistent spacing — scannable in under 5 seconds
+  - Single message, always under 4096 chars
+  - NO_TRADE is brief and unambiguous
 """
-
-import re
 
 from datetime import datetime, timezone
 
@@ -14,13 +16,7 @@ def _dir_emoji(d: str) -> str:
     return "🟢" if d.upper() == "BUY" else "🔴"
 
 
-def _e(text: str) -> str:
-    """Escape Markdown special chars in dynamic/LLM-sourced text."""
-    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
-
-
 def format_trade_plan(plan: dict, balance: float) -> str:
-    """Route to correct formatter based on plan type."""
     if plan.get("type") == "NO_TRADE":
         return _format_no_trade(plan)
     return _format_trade(plan, balance)
@@ -32,91 +28,78 @@ def _format_trade(plan: dict, balance: float) -> str:
     style     = plan.get("style", "swing").upper()
     se        = "⚡" if style == "SCALP" else "📈"
     de        = _dir_emoji(direction)
-    kz        = "✅ Kill Zone" if plan.get("kill_zone") else "⏳ Outside KZ"
+    kz        = "✅ Kill Zone" if plan.get("kill_zone") else "⚠️ Outside KZ"
     score     = plan.get("confluence", "?")
 
-    lines = []
+    # ── Header ──────────────────────────────────────────────
+    msg  = f"{de} *{direction} {pair}* — {se} {style}\n"
+    msg += f"📍 {plan.get('session', 'N/A')}  •  {kz}  •  ⭐ *{score}/10*\n"
+    msg += "─────────────────────\n"
 
-    # Header
-    lines.append(f"📊 *{pair}*  {se} {style}  {de} *{direction}*")
-    lines.append(f"Session: {plan.get('session','N/A')}  {kz}  ⭐ {score}/10")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    # ── Levels ──────────────────────────────────────────────
+    msg += f"*Price*    `{plan.get('live_price', 'N/A')}`\n"
+    msg += f"*Entry*    `{plan.get('entry', 'N/A')}`  _{plan.get('execution', '')}_\n"
+    msg += f"*SL*       `{plan.get('sl', 'N/A')}`  ({plan.get('sl_pips', '?')} pips)\n"
 
-    # Levels
-    lines.append(
-        f"Market : `{plan.get('live_price','N/A')}`   "
-        f"Execution: {plan.get('execution','N/A')}"
-    )
-    lines.append(f"Entry  : `{plan.get('entry','N/A')}`")
-    lines.append(f"SL     : `{plan.get('sl','N/A')}`  ({plan.get('sl_pips','N/A')} pips)")
-
-    # Key levels
+    # PDH / PDL on same line if both present
     pdh = plan.get("pdh")
     pdl = plan.get("pdl")
-    if pdh or pdl:
-        lines.append(f"PDH    : `{pdh}`   PDL : `{pdl}`")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    if pdh and pdl:
+        msg += f"*PDH/PDL*  `{pdh}` / `{pdl}`\n"
+    msg += "─────────────────────\n"
 
-    # Risk
-    lines.append(
-        f"Lot: {plan.get('lot','N/A')}  "
-        f"Pip: {plan.get('pip_value','N/A')}  "
-        f"Risk: {plan.get('risk_usd','N/A')}"
+    # ── Risk ────────────────────────────────────────────────
+    msg += (
+        f"*Lot* {plan.get('lot','N/A')}  "
+        f"*Pip* {plan.get('pip_value','N/A')}  "
+        f"*Risk* {plan.get('risk_usd','N/A')}\n"
     )
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    msg += "─────────────────────\n"
 
-    # Take profits
-    lines.append("🎯 *Take Profits*")
+    # ── Take Profits ────────────────────────────────────────
+    msg += "*🎯 Take Profits*\n"
     for tp in plan.get("tps", []):
-        lines.append(
-            f"{tp.get('label','TP')}  `{tp.get('price','N/A')}`  "
-            f"{tp.get('rr','N/A')}  close {tp.get('close','N/A')}  "
-            f"→ {tp.get('profit','N/A')}"
+        msg += (
+            f"`{tp.get('label','TP')}` "
+            f"`{tp.get('price','N/A')}`  "
+            f"{tp.get('rr','N/A')}  "
+            f"({tp.get('close','N/A')} → {tp.get('profit','N/A')})\n"
         )
-    lines.append(f"Total → *{plan.get('total_profit','N/A')}*")
+    msg += f"*Total* → {plan.get('total_profit','N/A')}\n"
 
     # Trailing stop
     trail = plan.get("trail", {})
     if trail and trail.get("active"):
-        lines.append(f"🔁 Trail {trail.get('pips','N/A')} pips from {trail.get('from','TP1')}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+        msg += f"🔁 Trail *{trail.get('pips','?')} pips* from {trail.get('from','TP1')}\n"
+    msg += "─────────────────────\n"
 
-    # AMD context
+    # ── AMD + Rationale ─────────────────────────────────────
     amd = plan.get("amd")
     if amd:
-        lines.append(f"🔬 *AMD*: {_e(amd)}")
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        msg += f"*📐 Structure*\n{amd}\n\n"
 
-    # Rationale
-    lines.append(f"📖 {_e(plan.get('rationale','N/A'))}")
+    msg += f"*📖 Rationale*\n{plan.get('rationale','N/A')}\n"
 
-    # Caution
+    # ── Caution ─────────────────────────────────────────────
     caution = plan.get("caution")
     if caution:
-        lines.append(f"⚠️ {_e(caution)}")
+        msg += f"\n⚠️ _{caution}_\n"
 
-    # Timestamp
-    lines.append(
-        f"\n⏱ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
-        f"  |  ⚠️ _Advisory only._"
-    )
+    # ── Footer ──────────────────────────────────────────────
+    msg += f"\n`{datetime.now(timezone.utc).strftime('%H:%M UTC')}` • _Advisory only_"
 
-    return "\n".join(lines)
+    return msg
 
 
 def _format_no_trade(plan: dict) -> str:
-    lines = [
-        "🚫 *NO TRADE — Conditions Not Met*",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"📋 {_e(plan.get('reason', 'No valid setup found at this time.'))}",
-    ]
+    msg  = "🚫 *No Trade — Conditions Not Met*\n"
+    msg += "─────────────────────\n"
+    msg += f"{plan.get('reason', 'No valid setup found at this time.')}\n"
     suggestion = plan.get("suggestion")
     if suggestion:
-        lines.append(f"💡 {_e(suggestion)}")
-    lines.append(
-        f"\n⏱ {datetime.now(timezone.utc).strftime('%H:%M UTC')}  |  Use /trade to try again."
-    )
-    return "\n".join(lines)
+        msg += f"\n💡 _{suggestion}_\n"
+    msg += f"\n`{datetime.now(timezone.utc).strftime('%H:%M UTC')}` • /trade to try again"
+    return msg
 
 
 def format_history_entry(trade: dict, index: int) -> str:
@@ -129,7 +112,7 @@ def format_history_entry(trade: dict, index: int) -> str:
     created   = trade.get("created_at") or "N/A"
     de        = _dir_emoji(direction)
     return (
-        f"{index}. {de} {direction} {pair}\n"
-        f"   Entry: {entry}  SL: {sl}  Risk: {risk}  ⭐{score}/10\n"
-        f"   📅 {created}"
+        f"{index}. {de} *{direction} {pair}*\n"
+        f"   Entry `{entry}`  SL `{sl}`  Risk {risk}  ⭐{score}/10\n"
+        f"   _{created}_"
     )
